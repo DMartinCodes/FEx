@@ -42,7 +42,7 @@ fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         // The calling thread works too.
         // If threads can't be created, the caller simply does more of the work.
-        let workers = (1..crate::walk::cores())
+        let workers = (1..std::thread::available_parallelism().map_or(4, |n| n.get()))
             .filter(|_| thread::Builder::new().name("fex-pool".into()).spawn(worker).is_ok())
             .count();
         Pool {
