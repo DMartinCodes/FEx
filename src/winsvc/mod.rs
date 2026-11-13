@@ -49,9 +49,23 @@ fn attach_console() {
 }
 
 /// Run `fex service <args>`; returns the process exit code.
+/// Panics on any service thread go to the service log (there's no console
+/// or desktop to show them on), then to the default hook.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        server::log(&format!("panic on thread '{}': {info}\r\n{}", thread.name().unwrap_or("<unnamed>"), std::backtrace::Backtrace::force_capture()));
+        default(info);
+    }));
+}
+
 pub fn cli(args: &[String]) -> i32 {
     if args.first().map(String::as_str) != Some("run") {
         attach_console();
+    }
+    if matches!(args.first().map(String::as_str), Some("run" | "debug")) {
+        log_panics();
     }
     let fail = |e: String| {
         eprintln!("{e}");

@@ -78,6 +78,9 @@ struct Shared {
     /// Running as root: can filter per user. Otherwise serves only its own uid.
     privileged: bool,
     dirty: AtomicBool,
+    /// Folders left out of the index (`skips`): queries inside them are not
+    /// covered, so clients search them themselves.
+    skip: RwLock<HashSet<Vec<u8>>>,
     /// Per client process, the number of its latest query: a newer query
     /// (search as you type) makes older ones stop.
     clients: Mutex<HashMap<i32, Arc<AtomicU64>>>,
@@ -104,6 +107,9 @@ fn is_network_fs(t: &str) -> bool {
     matches!(t, "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "fuse.sshfs" | "ceph" | "lustre" | "glusterfs" | "fuse.glusterfs" | "beegfs" | "gpfs" | "9p" | "afs")
 }
 
+/// Folders the index leaves out: pseudo filesystems, network mounts (unless
+/// asked for), and the daemon's own state folder (its snapshot writes would
+/// otherwise mark the index changed with every save).
 fn skips(cfg: &Config) -> HashSet<Vec<u8>> {
     let mut skip = HashSet::new();
     for m in sys::mounts() {
@@ -112,7 +118,12 @@ fn skips(cfg: &Config) -> HashSet<Vec<u8>> {
         }
     }
     skip.remove(&cfg.root);
+    skip.insert(cfg.state_dir.as_os_str().as_encoded_bytes().to_vec());
     skip
+}
+
+fn skipped(path: &[u8], skip: &HashSet<Vec<u8>>) -> bool {
+    skip.iter().any(|s| fsys::in_scope(path, s))
 }
 
 /// Paths to mark with fanotify: the root's filesystem and every indexed
@@ -189,6 +200,7 @@ pub fn run(cfg: Config) -> ExitCode {
         throttle,
         privileged,
         dirty: AtomicBool::new(false),
+        skip: RwLock::new(skip.clone()),
         clients: Mutex::new(HashMap::new()),
     });
 
@@ -309,7 +321,10 @@ fn refresh(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>, changed: Vec<Arc<
     if changed.is_empty() {
         return;
     }
-    let changed: Vec<Arc<[u8]>> = changed.into_iter().filter(|p| fsys::in_scope(p, &sh.root)).collect();
+    let changed: Vec<Arc<[u8]>> = changed.into_iter().filter(|p| fsys::in_scope(p, &sh.root) && !skipped(p, skip)).collect();
+    if changed.is_empty() {
+        return;
+    }
     let next = AtomicUsize::new(0);
     let scans = Mutex::new(Vec::with_capacity(changed.len()));
     thread::scope(|sc| {
@@ -367,7 +382,7 @@ fn sweep(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>) {
 }
 
 fn maintain(sh: &Shared, cfg: &Config, snap: &Path) {
-    let skip = skips(cfg);
+    let mut skip = skips(cfg);
     // Watch first, so nothing that changes during the crawl or sweep is missed.
     let fan = if cfg.fanotify && sh.privileged {
         match Fanotify::start(&watch_points(cfg, &skip)) {
@@ -440,6 +455,10 @@ fn maintain(sh: &Shared, cfg: &Config, snap: &Path) {
             }
         }
         if last_sweep.elapsed() >= cfg.sweep_every {
+            // Mounts come and go: a network share mounted since the last
+            // sweep must neither be crawled nor reported as covered.
+            skip = skips(cfg);
+            *sh.skip.write().unwrap_or_else(PoisonError::into_inner) = skip.clone();
             sweep(sh, cfg, &skip);
             last_sweep = Instant::now();
         }
@@ -609,7 +628,7 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 drop(guard);
                 return reply(&mut s, proto::BUSY, b"the first index is still being built");
             };
-            if !idx.covers(&scope) {
+            if !idx.covers(&scope) || skipped(&scope, &sh.skip.read().unwrap_or_else(PoisonError::into_inner)) {
                 let root = idx.root.to_vec();
                 drop(guard);
                 return reply(&mut s, proto::NOT_COVERED, &root);

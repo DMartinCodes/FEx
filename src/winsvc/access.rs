@@ -13,8 +13,9 @@
 //! * a query asks `AccessCheck` with the client's token, once per distinct
 //!   descriptor: no file opens at all;
 //! * the cache follows the change journal (`usn::Tail`): any permission
-//!   change clears it, and a folder created, deleted or renamed drops its
-//!   entry, so nothing stale outlives a second's poll.
+//!   change clears it; a folder created drops its entry, and a folder
+//!   deleted or renamed drops its whole subtree's (subfolders move without
+//!   records of their own), so nothing stale outlives a second's poll.
 //!
 //! Tokens without the traverse bypass, and drives without a change journal,
 //! use the exact check instead. Not covered: mandatory integrity labels
@@ -22,7 +23,7 @@
 //! policy only restricts writing up, not listing.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use windows_sys::Win32::Foundation::{HANDLE, LUID};
 use windows_sys::Win32::Security::{
@@ -63,63 +64,99 @@ fn read_sd(path: &str) -> Option<Sd> {
 
 /// Folder path -> its descriptor, shared by all queries; distinct
 /// descriptors are stored once.
+///
+/// Invalidation can race with a read in progress (the descriptor was read
+/// just before a permission change, the cache cleared just after): every
+/// invalidation bumps an epoch under the write lock, and a read only enters
+/// the cache if no invalidation happened since it started; otherwise it
+/// reads again. Entries hold the descriptor itself, so nothing can come to
+/// point at a different one.
 #[derive(Default)]
 pub struct Descriptors {
-    by_path: RwLock<HashMap<Box<str>, u32>>,
-    sds: RwLock<Vec<Arc<Sd>>>,
-    ids: Mutex<HashMap<Box<[u64]>, u32>>,
+    inner: RwLock<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    by_path: HashMap<Box<str>, Arc<Sd>>,
+    distinct: HashMap<Box<[u64]>, Arc<Sd>>,
+    epoch: u64,
 }
 
 fn key(path: &str) -> Box<str> {
     path.trim_end_matches('\\').to_lowercase().into()
 }
 
+/// `k` is `prefix` or lies beneath it (both keys).
+fn under(k: &str, prefix: &str) -> bool {
+    k.starts_with(prefix) && (k.len() == prefix.len() || k.as_bytes()[prefix.len()] == b'\\')
+}
+
 impl Descriptors {
-    /// The folder's descriptor id and descriptor, reading it if needed.
-    pub fn get(&self, path: &str) -> Option<(u32, Arc<Sd>)> {
-        let k = key(path);
-        if let Some(&id) = self.by_path.read().unwrap_or_else(PoisonError::into_inner).get(&k) {
-            return self.sds.read().unwrap_or_else(PoisonError::into_inner).get(id as usize).map(|sd| (id, sd.clone()));
-        }
-        let sd = read_sd(path)?;
-        let id = {
-            let mut ids = self.ids.lock().unwrap_or_else(PoisonError::into_inner);
-            match ids.get(&sd.words[..]) {
-                Some(&id) => id,
-                None => {
-                    let mut sds = self.sds.write().unwrap_or_else(PoisonError::into_inner);
-                    let id = sds.len() as u32;
-                    ids.insert(sd.words.clone().into_boxed_slice(), id);
-                    sds.push(Arc::new(sd));
-                    id
-                }
-            }
-        };
-        self.by_path.write().unwrap_or_else(PoisonError::into_inner).insert(k, id);
-        let sd = self.sds.read().unwrap_or_else(PoisonError::into_inner)[id as usize].clone();
-        Some((id, sd))
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Drop one folder's entry (created, deleted or renamed).
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The folder's descriptor, reading it if needed. `None` if it can't be
+    /// read (or keeps changing while being read): the folder stays hidden.
+    pub fn get(&self, path: &str) -> Option<Arc<Sd>> {
+        let k = key(path);
+        for _ in 0..3 {
+            let epoch = {
+                let g = self.read();
+                if let Some(sd) = g.by_path.get(&k) {
+                    return Some(sd.clone());
+                }
+                g.epoch
+            };
+            let sd = read_sd(path)?;
+            let mut g = self.write();
+            if g.epoch != epoch {
+                continue; // invalidated while reading: this copy may be stale
+            }
+            let words: Box<[u64]> = sd.words.clone().into_boxed_slice();
+            let sd = g.distinct.entry(words).or_insert_with(|| Arc::new(sd)).clone();
+            g.by_path.insert(k.clone(), sd.clone());
+            return Some(sd);
+        }
+        None
+    }
+
+    /// Drop a folder's entry (it was just created: its path may have named
+    /// another folder before).
     pub fn forget(&self, path: &str) {
-        self.by_path.write().unwrap_or_else(PoisonError::into_inner).remove(&key(path));
+        let mut g = self.write();
+        g.by_path.remove(&key(path));
+        g.epoch += 1;
+    }
+
+    /// Drop the entries of folders at or beneath `paths` (deleted or renamed:
+    /// their subfolders moved with them, without journal records of their own).
+    pub fn forget_trees(&self, paths: &[String]) {
+        let prefixes: Vec<Box<str>> = paths.iter().map(|p| key(p)).collect();
+        let mut g = self.write();
+        g.by_path.retain(|k, _| !prefixes.iter().any(|p| under(k, p)));
+        g.epoch += 1;
     }
 
     /// Drop everything (a permission changed somewhere).
     pub fn clear(&self) {
-        // Order matters: paths first, so no lookup finds an id whose
-        // descriptor is gone.
-        self.by_path.write().unwrap_or_else(PoisonError::into_inner).clear();
-        self.ids.lock().unwrap_or_else(PoisonError::into_inner).clear();
-        self.sds.write().unwrap_or_else(PoisonError::into_inner).clear();
+        let mut g = self.write();
+        g.by_path.clear();
+        g.distinct.clear();
+        g.epoch += 1;
     }
 
     pub fn folders(&self) -> usize {
-        self.by_path.read().unwrap_or_else(PoisonError::into_inner).len()
+        self.read().by_path.len()
     }
 
     pub fn distinct(&self) -> usize {
-        self.sds.read().unwrap_or_else(PoisonError::into_inner).len()
+        self.read().distinct.len()
     }
 }
 
@@ -199,18 +236,26 @@ mod tests {
         let cache = Descriptors::default();
         for (dir, want) in [(base.join("open"), true), (denied.clone(), false)] {
             let path = dir.to_string_lossy().to_string();
-            let (_, sd) = cache.get(&path).expect("descriptor readable");
+            let sd = cache.get(&path).expect("descriptor readable");
             assert_eq!(may_list(&sd, token), want, "{path}");
             assert_eq!(exact(&path, token), want, "exact check disagrees for {path}");
         }
-        // Identical descriptors are stored once; forgetting drops the entry.
+        // Identical descriptors are stored once.
+        std::fs::create_dir_all(base.join("open").join("sub")).unwrap();
         std::fs::create_dir_all(base.join("open2")).unwrap();
-        let a = cache.get(&base.join("open").to_string_lossy()).unwrap().0;
-        let b = cache.get(&base.join("open2").to_string_lossy()).unwrap().0;
-        assert_eq!(a, b);
+        let a = cache.get(&base.join("open").to_string_lossy()).unwrap();
+        let b = cache.get(&base.join("open2").to_string_lossy()).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(cache.distinct(), 2);
-        cache.forget(&base.join("open").to_string_lossy());
+        // A renamed folder takes its subtree's entries with it.
+        cache.get(&base.join("open").join("sub").to_string_lossy()).unwrap();
+        assert_eq!(cache.folders(), 4);
+        cache.forget_trees(&[base.join("open").to_string_lossy().to_uppercase()]);
         assert_eq!(cache.folders(), 2);
+        cache.forget(&base.join("open2").to_string_lossy());
+        assert_eq!(cache.folders(), 1);
+        cache.clear();
+        assert_eq!((cache.folders(), cache.distinct()), (0, 0));
         unsafe { CloseHandle(token) };
         let _ = std::fs::remove_dir_all(base);
     }

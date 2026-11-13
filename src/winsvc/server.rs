@@ -108,8 +108,16 @@ pub fn log(msg: &str) {
 static LOG_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Ask the running service to stop (from the SCM's control handler).
+/// Crawls in progress, so stopping can cancel them.
+static CRAWLS: Mutex<Vec<std::sync::Weak<Build>>> = Mutex::new(Vec::new());
+
 pub fn request_stop() {
     STOP.store(true, Relaxed);
+    for b in CRAWLS.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
+        if let Some(b) = b.upgrade() {
+            b.cancel();
+        }
+    }
     // Wake the accept loop, which is blocked waiting for a client.
     let name = wide(proto::PIPE);
     let h = unsafe { CreateFileW(name.as_ptr(), 0, 0, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
@@ -167,6 +175,8 @@ struct Drive {
 
 struct Shared {
     drives: Vec<Drive>,
+    /// The service's own folder (state and log): its changes don't count.
+    own: Arc<[String]>,
     /// Folder security descriptors, shared by all queries.
     sds: Descriptors,
     /// Per client process, the number of its latest query: older ones stop.
@@ -214,6 +224,7 @@ pub fn run(cfg: Config, ready: impl FnOnce()) {
         throttle: Throttle::start(cfg.reserve.unwrap_or(profile.reserve), profile.cores),
         sds: Descriptors::default(),
         clients: Mutex::new(HashMap::new()),
+        own: Arc::from([cfg.state_dir.parent().unwrap_or(&cfg.state_dir).to_string_lossy().into_owned()]),
         activity: Mutex::new("starting"),
         verified_ns: AtomicU64::new(0),
         dir: cfg.state_dir.clone(),
@@ -234,7 +245,7 @@ pub fn run(cfg: Config, ready: impl FnOnce()) {
         let _ = m.join();
     }
     for d in &sh.drives {
-        save_drive(&sh, d);
+        save_drive(&sh, d, true);
     }
     log("stopped");
 }
@@ -255,26 +266,49 @@ fn on_change(stale: Arc<AtomicBool>) -> impl Fn(Freshness) + Send + 'static {
 
 fn hooks(sh: &Arc<Shared>) -> Hooks {
     let t = sh.throttle.clone();
-    Hooks { init: Box::new(throttle::background_thread), pace: Box::new(move || t.wait()) }
+    Hooks { init: Box::new(throttle::background_thread), pace: Box::new(move || t.wait()), ignore: sh.own.clone() }
 }
 
 /// Crawl a drive in the background and swap the result in.
 fn crawl(sh: &Arc<Shared>, d: &Drive) -> Option<usize> {
     let t = Instant::now();
+    if STOP.load(Relaxed) {
+        return None;
+    }
     let build = Build::with_hooks(&d.root, hooks(sh));
+    {
+        let mut crawls = CRAWLS.lock().unwrap_or_else(PoisonError::into_inner);
+        crawls.retain(|b| b.strong_count() > 0);
+        crawls.push(Arc::downgrade(&build));
+    }
+    // Stop may have come between the check above and registering.
+    if STOP.load(Relaxed) {
+        return None;
+    }
     let idx = build.run(&|_, _| {})?;
     let entries = idx.entries;
     log(&format!("crawled {}: {entries} entries in {:.1} s ({} unreadable)", d.root, t.elapsed().as_secs_f64(), idx.errors));
     d.stale.store(false, Relaxed);
     let live = Live::new(idx, build.take_freshener(), on_change(d.stale.clone()));
     *d.live.write().unwrap_or_else(PoisonError::into_inner) = Some(live);
-    save_drive(sh, d);
+    save_drive(sh, d, false);
     Some(entries)
 }
 
-/// Save a drive's index with the journal position it is current to.
-fn save_drive(sh: &Shared, d: &Drive) {
+/// Save a drive's index with the journal position it is current to
+/// (`only_dirty`: unless nothing changed since the last save). An index
+/// whose watcher lost changes is not saved, and its old journal position is
+/// dropped: the next start must crawl rather than trust it.
+fn save_drive(sh: &Shared, d: &Drive, only_dirty: bool) {
     let Some(live) = d.live.read().unwrap_or_else(PoisonError::into_inner).clone() else { return };
+    if d.stale.load(Relaxed) {
+        let _ = std::fs::remove_file(saved_paths(&sh.dir, &d.root).1);
+        log(&format!("{}: not saved (changes were lost); it will be crawled at the next start", d.root));
+        return;
+    }
+    if only_dirty && !index::read(&live.index).dirty {
+        return;
+    }
     // The position is taken first, then the watcher gets a moment to apply
     // what came before it: replaying a little twice is harmless, missing
     // a change isn't.
@@ -309,7 +343,7 @@ fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
             return;
         }
         // Watch before loading, so nothing in between is missed.
-        let fresh = index::Freshener::start(d.root.as_str().into());
+        let fresh = index::Freshener::start_ignoring(d.root.as_str().into(), sh.own.clone());
         let (idx_path, pos_path) = saved_paths(&sh.dir, &d.root);
         let t = Instant::now();
         let loaded = Index::load(&idx_path).filter(|i| index::in_scope(&d.root, &i.root) && index::in_scope(&i.root, &d.root));
@@ -369,7 +403,7 @@ fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
             let live = d.live.read().unwrap_or_else(PoisonError::into_inner).clone();
             let dirty = live.as_ref().is_some_and(|l| index::try_read(&l.index).is_some_and(|i| i.dirty));
             if dirty && d.last_save.lock().unwrap_or_else(PoisonError::into_inner).elapsed() >= save_every {
-                save_drive(sh, d);
+                save_drive(sh, d, true);
             }
         }
     }
@@ -406,13 +440,18 @@ fn prefetch_descriptors(sh: &Arc<Shared>) {
 }
 
 /// Keep the descriptor cache true to the disk: follow each drive's change
-/// journal every second. A permission change anywhere clears the cache; a
-/// folder created, deleted or renamed drops its own entry (its path may now
-/// name a different folder).
+/// journal every second. A permission change anywhere clears the cache. A
+/// folder created drops its entry (its path may have named another folder);
+/// a folder deleted or renamed, at its old or new path, drops its whole
+/// subtree's (subfolders move with it, without records of their own).
 fn follow_permissions(sh: &Arc<Shared>) {
     const SECURITY: u32 = 0x800;
-    const NAMES: u32 = 0x100 | 0x200 | 0x1000 | 0x2000; // create, delete, rename old/new
+    const CREATE: u32 = 0x100;
+    const MOVED: u32 = 0x200 | 0x1000 | 0x2000; // delete, rename old/new name
+    const NAMES: u32 = CREATE | MOVED;
     const DIRECTORY: u32 = 0x10;
+    /// More subtrees than this in one poll: clearing is cheaper.
+    const MAX_TREES: usize = 64;
     let mut tails: Vec<Option<usn::Tail>> = sh.drives.iter().map(|d| usn::Tail::start(&d.root)).collect();
     for (d, t) in sh.drives.iter().zip(&tails) {
         d.tracked.store(t.is_some(), Relaxed);
@@ -427,13 +466,31 @@ fn follow_permissions(sh: &Arc<Shared>) {
                 Polled::Lost => sh.sds.clear(),
                 Polled::Records(records) => {
                     let dirs: Vec<_> = records.into_iter().filter(|(r, _)| r.attrs & DIRECTORY != 0).collect();
-                    if dirs.iter().any(|(r, _)| r.reason & SECURITY != 0) || dirs.len() > 5000 {
+                    let mut trees = Vec::new();
+                    let mut created = Vec::new();
+                    let mut unresolved = false;
+                    for (r, parent) in &dirs {
+                        let Some(p) = parent else {
+                            // The parent is gone too; its own record covers it,
+                            // but a rename into a vanished folder can't be placed.
+                            unresolved |= r.reason & MOVED != 0;
+                            continue;
+                        };
+                        let path = fsys::join(p, &r.name);
+                        if r.reason & MOVED != 0 {
+                            trees.push(path);
+                        } else {
+                            created.push(path);
+                        }
+                    }
+                    if unresolved || trees.len() > MAX_TREES || dirs.iter().any(|(r, _)| r.reason & SECURITY != 0) || dirs.len() > 5000 {
                         sh.sds.clear();
                     } else {
-                        for (r, parent) in dirs {
-                            if let Some(p) = parent {
-                                sh.sds.forget(&fsys::join(&p, &r.name));
-                            }
+                        if !trees.is_empty() {
+                            sh.sds.forget_trees(&trees);
+                        }
+                        for path in created {
+                            sh.sds.forget(&path);
                         }
                     }
                 }
@@ -471,7 +528,11 @@ fn serve_pipe(sh: &Arc<Shared>, ready: impl FnOnce()) {
         if h == INVALID_HANDLE_VALUE {
             log(&format!("cannot create {}: {}", proto::PIPE, std::io::Error::last_os_error()));
             if first {
-                return; // someone else owns the name
+                // Someone else owns the name: give up, and let `run` finish
+                // (maintenance stops too) instead of hanging in start-up.
+                log("another process holds the index pipe; stopping");
+                request_stop();
+                return;
             }
             thread::sleep(Duration::from_millis(500));
             continue;
@@ -609,7 +670,7 @@ impl Visibility for AccessVisibility<'_> {
         }
         let ok = match self.sds.get(path) {
             None => false,
-            Some((_, sd)) => {
+            Some(sd) => {
                 let k = Arc::as_ptr(&sd) as usize;
                 let known = self.decided.lock().unwrap_or_else(PoisonError::into_inner).get(&k).map(|e| e.1);
                 known.unwrap_or_else(|| {

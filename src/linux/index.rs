@@ -151,8 +151,10 @@ pub struct Shard {
 }
 
 impl Shard {
+    /// Entries in this shard.
     #[inline]
-    fn len(&self) -> usize {
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
         self.starts.len()
     }
 

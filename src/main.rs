@@ -170,6 +170,8 @@ fn parse_args() -> Args {
 fn main() -> eframe::Result {
     // `fex service ...`: the index service and its tools, no window.
     if std::env::args().nth(1).as_deref() == Some("service") {
+        // Native crashes leave a minidump; panics are logged by winsvc.
+        install_dump_writer();
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(winsvc::cli(&args));
     }

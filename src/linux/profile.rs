@@ -168,9 +168,8 @@ fn entry_cost_ns(sample: &[u8], skip: &HashSet<Vec<u8>>) -> u64 {
     let root: Arc<[u8]> = sample.into();
     let (shards, _) = index::crawl(std::slice::from_ref(&root), &c);
     let cpu = process_cpu_ns().saturating_sub(before);
-    let entries = seen.load(std::sync::atomic::Ordering::Relaxed).max(1) as u64;
-    drop(shards);
-    // Partial batches aren't counted in `seen`; this errs on the high side.
+    // The shards hold every entry crawled (`seen` only counts full batches).
+    let entries = shards.iter().map(|s| s.len()).sum::<usize>().max(1) as u64;
     (cpu / entries).clamp(200, 100_000)
 }
 

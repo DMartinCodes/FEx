@@ -848,10 +848,19 @@ fn lock_pending(m: &Mutex<Pending>) -> MutexGuard<'_, Pending> {
 }
 
 impl Freshener {
-    pub fn start(root: Arc<str>) -> Freshener {
+    /// Start watching `root`, disregarding changes at or below the folders
+    /// in `ignore` (the index service's own state and log, which would
+    /// otherwise mark the index changed with every save; empty for the app).
+    pub fn start_ignoring(root: Arc<str>, ignore: Arc<[String]>) -> Freshener {
         let state = Arc::new(Mutex::new(Pending { target: None, backlog: Vec::new(), overflowed: false }));
         let (s, r) = (state.clone(), root.clone());
-        let watcher = watch::watch_tree(root.to_string(), move |batch| {
+        let watcher = watch::watch_tree(root.to_string(), move |mut batch| {
+            if let Some(changes) = batch.as_mut().filter(|_| !ignore.is_empty()) {
+                changes.retain(|(_, rel)| !ignore.iter().any(|i| in_scope(&fsys::join(&r, rel), i)));
+                if changes.is_empty() {
+                    return;
+                }
+            }
             let mut st = lock_pending(&s);
             match batch {
                 Some(changes) if st.backlog.len() + changes.len() <= MAX_BACKLOG => st.backlog.extend(changes),
@@ -1005,6 +1014,8 @@ pub struct Build {
 pub struct Hooks {
     pub init: Box<dyn Fn() + Send + Sync>,
     pub pace: Box<dyn Fn() + Send + Sync>,
+    /// Folders whose changes the finished index's watcher disregards.
+    pub ignore: Arc<[String]>,
 }
 
 impl Build {
@@ -1044,7 +1055,8 @@ impl Build {
     /// Crawl `root` on all cores. Calls `on_hits(generation, rows)` with
     /// batches of streamed matches. Returns `None` if cancelled.
     pub fn run(&self, on_hits: &(dyn Fn(u64, Vec<Row>) + Sync)) -> Option<Index> {
-        *self.fresh.lock().unwrap_or_else(PoisonError::into_inner) = Some(Freshener::start(self.root.clone()));
+        let ignore = self.hooks.as_ref().map_or_else(|| Arc::from([]), |h| h.ignore.clone());
+        *self.fresh.lock().unwrap_or_else(PoisonError::into_inner) = Some(Freshener::start_ignoring(self.root.clone(), ignore));
         let cores = walk::cores();
         // Network enumeration is latency-bound, so oversubscribe there.
         let workers = std::env::var("FEX_CRAWL_THREADS")
