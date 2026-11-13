@@ -34,6 +34,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::fanotify::{Events, Fanotify};
+use super::profile::{self, Profile};
 use super::index::{self, Crawl, Everything, Index, Matcher, Visibility};
 use super::proto::{self, Reader};
 use super::throttle::{self, Throttle};
@@ -52,6 +53,8 @@ pub struct Config {
     pub workers: usize,
     /// Pause background work when others' I/O stall share exceeds this (%).
     pub io_limit: f64,
+    /// CPU share reserved under full load, overriding the profile's.
+    pub reserve: Option<f64>,
 }
 
 /// Concurrent client connections served; more wait in the listen queue.
@@ -152,7 +155,21 @@ pub fn run(cfg: Config) -> ExitCode {
         Err(_) => None,
     };
     let verified = loaded.as_ref().map_or(0, |i| i.created_ns);
-    let throttle = Throttle::start(cfg.io_limit);
+    let profile_path = cfg.state_dir.join("profile");
+    let skip = skips(&cfg);
+    let profile = match Profile::load(&profile_path) {
+        Some(p) if p.cores == super::walk::cores() => p,
+        _ => {
+            let known = shared_entries(&snap);
+            let p = profile::measure(&cfg.root, &skip, known);
+            if let Err(e) = p.save(&profile_path) {
+                log(&format!("saving {}: {e}", profile_path.display()));
+            }
+            p
+        }
+    };
+    log(&format!("profile: {}", profile.describe().replace('\n', "; ")));
+    let throttle = Throttle::start(cfg.io_limit, cfg.reserve.unwrap_or(profile.reserve), profile.cores);
     if !throttle.own_cgroup {
         log("not in a cgroup of its own: its own I/O stalls count as pressure (run it as a systemd service for accurate throttling)");
     }
@@ -184,6 +201,11 @@ pub fn run(cfg: Config) -> ExitCode {
     };
     // Anyone may connect; what they see is filtered per query.
     let _ = std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(0o666));
+    // Which socket file is ours: a successor may replace it before we exit.
+    let ours = std::fs::metadata(&cfg.socket).map(|m| {
+        use std::os::unix::fs::MetadataExt;
+        (m.dev(), m.ino())
+    });
     log(&format!(
         "serving {} on {}{}",
         String::from_utf8_lossy(&cfg.root),
@@ -225,8 +247,19 @@ pub fn run(cfg: Config) -> ExitCode {
     if shared.dirty.load(Relaxed) {
         save(&shared, &snap, false);
     }
-    let _ = std::fs::remove_file(&cfg.socket);
+    let still_ours = std::fs::metadata(&cfg.socket).is_ok_and(|m| {
+        use std::os::unix::fs::MetadataExt;
+        ours.as_ref().is_ok_and(|&(dev, ino)| (m.dev(), m.ino()) == (dev, ino))
+    });
+    if still_ours {
+        let _ = std::fs::remove_file(&cfg.socket);
+    }
     ExitCode::SUCCESS
+}
+
+/// Entries in an existing snapshot, if any (a better file count than inodes).
+fn shared_entries(snap: &Path) -> Option<u64> {
+    Index::load(snap).ok().map(|i| i.entries as u64)
 }
 
 /// Tell systemd (Type=notify) that the socket is ready.
@@ -360,6 +393,19 @@ fn maintain(sh: &Shared, cfg: &Config, snap: &Path) {
         let started = now_ns();
         let Some(idx) = index::build(&cfg.root, &background_crawl(cfg, sh, &skip, &seen)) else { return };
         log(&format!("crawled {} entries, {} folders in {:.2} s ({} unreadable)", idx.entries, idx.dirs, t.elapsed().as_secs_f64(), idx.errors));
+        // The profile estimated the file count; now it's known.
+        let path = cfg.state_dir.join("profile");
+        if let Some(p) = Profile::load(&path) {
+            let files = idx.entries as u64;
+            if files.abs_diff(p.files) * 5 > p.files {
+                let p = p.with_files(files);
+                let _ = p.save(&path);
+                if cfg.reserve.is_none() {
+                    sh.throttle.set_reserve(p.reserve);
+                }
+                log(&format!("profile updated with the real file count: reserve {:.2}%", p.reserve * 100.0));
+            }
+        }
         *sh.index.write().unwrap_or_else(PoisonError::into_inner) = Some(idx);
         sh.verified_ns.store(started, Relaxed);
         save(sh, snap, true);
@@ -540,12 +586,18 @@ fn serve(sh: &Shared, mut s: UnixStream) {
             let Ok((regex, limit, scope, text)) = parsed else {
                 return reply(&mut s, proto::ERROR, b"malformed request");
             };
+            // Older clients stop here: whole result, name order.
+            let order = r.u8().unwrap_or(proto::NAME_ASC);
+            let first = r.u32().unwrap_or(u32::MAX) as usize;
             if !scope.starts_with(b"/") || text.len() > 4096 {
                 return reply(&mut s, proto::ERROR, b"scope must be an absolute path; queries are limited to 4096 bytes");
             }
             let m = match Matcher::new(&text, regex) {
                 Ok(Some(m)) => m,
-                Ok(None) => return send_rows(&mut s, &[], 0),
+                Ok(None) => {
+                    let _ = proto::send(&mut s, &Encoder::new(0).chunk(&[], true));
+                    return;
+                }
                 Err(e) => return reply(&mut s, proto::ERROR, e.as_bytes()),
             };
             let limit = limit.min(proto::MAX_LIMIT) as usize;
@@ -559,15 +611,45 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 drop(guard);
                 return reply(&mut s, proto::NOT_COVERED, &root);
             }
-            let result = if creds.uid == 0 || !sh.privileged {
-                idx.query_as(&m, &scope, limit, &|| false, &Everything)
+            let hits = if creds.uid == 0 || !sh.privileged {
+                idx.query_hits(&m, &scope, &|| false, &Everything)
             } else {
                 let vis = UserVisibility { creds: &creds, cache: (0..idx.dir_slots()).map(|_| AtomicU8::new(0)).collect(), checks: AtomicUsize::new(0) };
-                idx.query_as(&m, &scope, limit, &|| false, &vis)
+                idx.query_hits(&m, &scope, &|| false, &vis)
             };
+            let mut hits = hits.unwrap_or_default();
+            let total = hits.len();
+            let desc = order == proto::NAME_DESC;
+            // The first screenful, found and sorted in place in the index
+            // (one linear selection over all matches, before anything else).
+            let first = first.clamp(1, MAX_FIRST).min(hits.len()).min(limit);
+            if order != proto::UNORDERED && first > 0 {
+                if first < hits.len() {
+                    hits.select_nth_unstable_by(first - 1, |a, b| idx.hit_cmp(a, b, desc));
+                }
+                hits[..first].sort_unstable_by(|a, b| idx.hit_cmp(a, b, desc));
+            }
+            let kept = limit.min(hits.len());
+            let mut enc = Encoder::new(total);
+            // Small enough to sit in the socket buffer, so sending it under
+            // the index lock can't block on a slow client.
+            let sent = proto::send(&mut s, &enc.chunk(&idx.hit_rows(&hits[..first]), first == kept)).is_ok();
+            // Past the limit, keep the rows that come first by name.
+            let mut tail = hits.split_off(first);
+            idx.top_hits(&mut tail, kept - first, desc);
+            let rest = idx.hit_rows(&tail);
+            let hits_len = kept;
             drop(guard);
-            let (rows, total) = result.unwrap_or_default();
-            send_rows(&mut s, &rows, total);
+            if sent && first < hits_len {
+                let mut at = 0;
+                while at < rest.len() {
+                    let end = (at + CHUNK_ROWS).min(rest.len());
+                    if proto::send(&mut s, &enc.chunk(&rest[at..end], end == rest.len())).is_err() {
+                        break;
+                    }
+                    at = end;
+                }
+            }
         }
         Ok(proto::STATUS) => {
             let g = sh.index.read().unwrap_or_else(PoisonError::into_inner);
@@ -577,6 +659,7 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 watched: sh.watched.load(Relaxed),
                 activity: sh.activity.lock().unwrap_or_else(PoisonError::into_inner).to_string(),
                 paused: sh.throttle.paused().unwrap_or_default(),
+                reserve: sh.throttle.reserve_state(),
                 ..Default::default()
             };
             if let Some(i) = g.as_ref() {
@@ -594,28 +677,49 @@ fn serve(sh: &Shared, mut s: UnixStream) {
     }
 }
 
-fn send_rows(s: &mut UnixStream, rows: &[fsys::Row], total: usize) {
-    let mut dirs: HashMap<&[u8], u32> = HashMap::new();
-    let mut order: Vec<&[u8]> = Vec::new();
-    let mut body = Vec::with_capacity(rows.len() * 24 + 64);
-    let mut encoded = Vec::with_capacity(rows.len() * 20);
-    for row in rows {
-        let dir: &[u8] = row.dir.as_deref().unwrap_or(b"");
-        let id = *dirs.entry(dir).or_insert_with(|| {
-            order.push(dir);
-            (order.len() - 1) as u32
-        });
-        proto::put_u32(&mut encoded, id);
-        encoded.push(row.flags);
-        proto::put_bytes(&mut encoded, &row.name);
+/// Rows per chunk after the first.
+const CHUNK_ROWS: usize = 16 * 1024;
+/// Largest first chunk (rows); about 60 KB, well inside a socket buffer.
+const MAX_FIRST: usize = 1000;
+
+/// Encodes a streamed reply: the header goes with the first chunk, and
+/// each folder path is sent once, numbered across chunks.
+struct Encoder {
+    header: Option<u64>,
+    dirs: HashMap<Arc<[u8]>, u32>,
+}
+
+impl Encoder {
+    fn new(total: usize) -> Encoder {
+        Encoder { header: Some(total as u64), dirs: HashMap::new() }
     }
-    body.push(proto::OK);
-    proto::put_u64(&mut body, total as u64);
-    proto::put_u32(&mut body, order.len() as u32);
-    for d in order {
-        proto::put_bytes(&mut body, d);
+
+    fn chunk(&mut self, rows: &[fsys::Row], last: bool) -> Vec<u8> {
+        let mut body = Vec::with_capacity(rows.len() * 24 + 32);
+        if let Some(total) = self.header.take() {
+            body.push(proto::OK);
+            proto::put_u64(&mut body, total);
+        }
+        body.push(last as u8);
+        let mut new_dirs: Vec<Arc<[u8]>> = Vec::new();
+        let mut encoded = Vec::with_capacity(rows.len() * 20);
+        for row in rows {
+            let dir = row.dir.clone().unwrap_or_else(|| Arc::from(&b""[..]));
+            let next = self.dirs.len() as u32;
+            let id = *self.dirs.entry(dir.clone()).or_insert_with(|| {
+                new_dirs.push(dir);
+                next
+            });
+            proto::put_u32(&mut encoded, id);
+            encoded.push(row.flags);
+            proto::put_bytes(&mut encoded, &row.name);
+        }
+        proto::put_u32(&mut body, new_dirs.len() as u32);
+        for d in &new_dirs {
+            proto::put_bytes(&mut body, d);
+        }
+        proto::put_u32(&mut body, rows.len() as u32);
+        body.extend_from_slice(&encoded);
+        body
     }
-    proto::put_u32(&mut body, rows.len() as u32);
-    body.extend_from_slice(&encoded);
-    let _ = proto::send(s, &body);
 }

@@ -231,7 +231,7 @@ impl Shard {
             }
         };
         let (size, mtime) = self.meta.get(i).copied().unwrap_or((0, 0));
-        Row { name: self.name(i).into(), dir: Some(dir), size, mtime, flags: self.entry_flags[i], sel: false }
+        Row { name: self.name(i).into(), dir: Some(dir), size, mtime, flags: self.entry_flags[i], sel: false, id: 0 }
     }
 
     fn scan(&self, m: &Matcher, a: usize, b: usize, mut hit: impl FnMut(usize)) {
@@ -320,6 +320,8 @@ const CHUNK: usize = 32 * 1024;
 
 /// (shard, folder) within an index.
 type DirRef = (u32, u32);
+/// (shard, entry): one search match.
+pub type Hit = (u32, u32);
 /// A re-read folder: its ctime and (name, flags) entries.
 type Listing = (i64, Vec<(Box<[u8]>, u8)>);
 
@@ -367,7 +369,6 @@ pub struct Index {
     dead_entries: usize,
     pub errors: usize,
     pub build_time: Duration,
-    pub with_meta: bool,
     /// When the data was crawled, or the snapshot written (ns since epoch).
     pub created_ns: u64,
     /// Bumped by every change.
@@ -397,7 +398,7 @@ fn now_ns() -> u64 {
 }
 
 impl Index {
-    fn from_shards(root: Arc<[u8]>, shards: Vec<Shard>, errors: usize, build_time: Duration, with_meta: bool) -> Index {
+    fn from_shards(root: Arc<[u8]>, shards: Vec<Shard>, errors: usize, build_time: Duration) -> Index {
         let dead = shards.iter().map(|s| vec![false; s.ndirs()]).collect();
         Index {
             root,
@@ -410,7 +411,6 @@ impl Index {
             dead_entries: 0,
             errors,
             build_time,
-            with_meta,
             created_ns: now_ns(),
             generation: 0,
             from_snapshot: false,
@@ -489,7 +489,9 @@ impl Index {
         self.query_as(m, scope, limit, cancelled, &Everything)
     }
 
-    /// `query` reporting (and counting) only entries of folders `vis` allows.
+    /// `query` reporting (and counting) only entries of folders `vis`
+    /// allows. When there are more than `limit` matches, the rows kept are
+    /// the first `limit` in name order.
     pub fn query_as(
         &self,
         m: &Matcher,
@@ -498,6 +500,15 @@ impl Index {
         cancelled: &(dyn Fn() -> bool + Sync),
         vis: &dyn Visibility,
     ) -> Option<(Vec<Row>, usize)> {
+        let mut hits = self.query_hits(m, scope, cancelled, vis)?;
+        let total = hits.len();
+        self.top_hits(&mut hits, limit, false);
+        Some((self.hit_rows(&hits), total))
+    }
+
+    /// Every match under `scope` that `vis` allows, as (shard, entry) pairs:
+    /// 8 bytes each, no names copied. Deterministic order.
+    pub fn query_hits(&self, m: &Matcher, scope: &[u8], cancelled: &(dyn Fn() -> bool + Sync), vis: &dyn Visibility) -> Option<Vec<Hit>> {
         let units = self.query_units(scope);
         let mut base = Vec::with_capacity(self.shards.len());
         let mut acc = 0;
@@ -506,10 +517,8 @@ impl Index {
             acc += s.ndirs();
         }
         let filters = vis.filters();
-        let total = AtomicUsize::new(0);
-        let retained = AtomicUsize::new(0);
         let aborted = AtomicBool::new(false);
-        let parts: Vec<Mutex<Vec<(usize, Row)>>> = units.iter().map(|_| Mutex::new(Vec::new())).collect();
+        let parts: Vec<Mutex<Vec<Hit>>> = units.iter().map(|_| Mutex::new(Vec::new())).collect();
         pool::for_each(units.len(), &|u| {
             if aborted.load(Relaxed) || cancelled() {
                 aborted.store(true, Relaxed);
@@ -519,8 +528,6 @@ impl Index {
             let (si, a, b) = units[u];
             let shard = &self.shards[si];
             let mut out = Vec::new();
-            let mut count = 0;
-            let mut cache = None;
             let mut last: Option<(u32, bool)> = None;
             shard.scan(m, a, b, |i| {
                 if filters {
@@ -537,23 +544,44 @@ impl Index {
                         return;
                     }
                 }
-                count += 1;
-                if retained.load(Relaxed) < limit {
-                    let slot = retained.fetch_add(1, Relaxed);
-                    if slot < limit {
-                        out.push((slot, shard.row(i, &mut cache)));
-                    }
-                }
+                out.push((si as u32, i as u32));
             });
-            total.fetch_add(count, Relaxed);
             *parts[u].lock().unwrap_or_else(PoisonError::into_inner) = out;
         });
         if aborted.load(Relaxed) {
             return None;
         }
-        let mut rows: Vec<(usize, Row)> = parts.into_iter().flat_map(|p| p.into_inner().unwrap_or_else(PoisonError::into_inner)).collect();
-        rows.sort_unstable_by_key(|(slot, _)| *slot);
-        Some((rows.into_iter().map(|(_, r)| r).collect(), total.load(Relaxed)))
+        Some(parts.into_iter().flat_map(|p| p.into_inner().unwrap_or_else(PoisonError::into_inner)).collect())
+    }
+
+    /// Order of two hits as the UI sorts by name: folders first, then
+    /// case-insensitive name (`fsys::cmp_rows` with `SortKey::Name`),
+    /// compared in place in the arenas.
+    pub fn hit_cmp(&self, a: &Hit, b: &Hit, desc: bool) -> std::cmp::Ordering {
+        let (sa, sb) = (&self.shards[a.0 as usize], &self.shards[b.0 as usize]);
+        let (ia, ib) = (a.1 as usize, b.1 as usize);
+        let (da, db) = (sa.entry_flags[ia] & DIR != 0, sb.entry_flags[ib] & DIR != 0);
+        db.cmp(&da).then_with(|| {
+            let o = fsys::cmp_names(sa.name(ia), sb.name(ib));
+            if desc { o.reverse() } else { o }
+        })
+    }
+
+    /// Keep only the `n` hits that come first in name order (in no
+    /// particular order among themselves): linear time, no sorting.
+    pub fn top_hits(&self, hits: &mut Vec<Hit>, n: usize, desc: bool) {
+        if hits.len() > n {
+            if n > 0 {
+                hits.select_nth_unstable_by(n - 1, |a, b| self.hit_cmp(a, b, desc));
+            }
+            hits.truncate(n);
+        }
+    }
+
+    /// Result rows for hits (names and folders copied out of the index).
+    pub fn hit_rows(&self, hits: &[Hit]) -> Vec<Row> {
+        let mut caches: Vec<Option<(u32, Arc<[u8]>)>> = vec![None; self.shards.len()];
+        hits.iter().map(|&(s, i)| self.shards[s as usize].row(i as usize, &mut caches[s as usize])).collect()
     }
 
     // ------------------------------------------------------------ freshness
@@ -801,7 +829,7 @@ impl Index {
         if shard.len() as u64 != l.info.entries || shard.ndirs() as u64 != l.info.dirs {
             return Err("snapshot is damaged (counts)".into());
         }
-        let mut index = Index::from_shards(root.to_vec().into(), vec![shard], l.info.errors as usize, Duration::from_nanos(l.info.build_ns), false);
+        let mut index = Index::from_shards(root.to_vec().into(), vec![shard], l.info.errors as usize, Duration::from_nanos(l.info.build_ns));
         index.created_ns = l.info.created_ns;
         index.from_snapshot = true;
         Ok(index)
@@ -882,7 +910,7 @@ pub fn build(root: &[u8], c: &Crawl) -> Option<Index> {
     if c.cancel.load(Relaxed) {
         return None;
     }
-    Some(Index::from_shards(root, shards, errors, started.elapsed(), c.with_meta))
+    Some(Index::from_shards(root, shards, errors, started.elapsed()))
 }
 
 /// An in-progress crawl started by the UI, on all cores at normal priority.

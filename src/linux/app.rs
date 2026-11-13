@@ -24,6 +24,8 @@ use crate::typeahead;
 
 /// Search results materialized for display; the total count is still exact.
 const MAX_RESULTS: usize = 250_000;
+/// Rows in the first chunk of a daemon reply: more than a tall window shows.
+const SCREENFUL: u32 = 200;
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(30);
 const MAX_INDEXES: usize = 4;
 const TYPEAHEAD_RESET: Duration = Duration::from_millis(1200);
@@ -34,7 +36,12 @@ enum Msg {
     Listing { generation: u64, result: Result<Vec<Row>, String>, took: Duration },
     Changes { generation: u64, changes: Vec<Change> },
     Built(Option<Index>),
-    Results { generation: u64, rows: Vec<Row>, total: usize, query: Duration, meta: Duration },
+    /// The first rows of a search (all of them for in-process searches).
+    Results { generation: u64, rows: Vec<Row>, total: usize, first: Duration, complete: bool },
+    /// More rows of a streamed search; `complete` on the last batch.
+    MoreRows { generation: u64, rows: Vec<Row>, complete: bool },
+    /// Sizes and dates for result rows, by row id.
+    Meta { generation: u64, filled: Vec<(u32, u64, i64)> },
     Fonts(Option<String>),
     /// Latest status of the index daemon (`None`: not running).
     Daemon(Option<proto::Status>),
@@ -45,8 +52,115 @@ enum Msg {
 struct Results {
     rows: Vec<Row>,
     total: usize,
-    query: Duration,
-    meta: Duration,
+    started: Instant,
+    /// Time until the first rows were shown.
+    first: Duration,
+    /// Time until every row had arrived (None while streaming).
+    all: Option<Duration>,
+    /// Whether each row (by id) has its size and date yet.
+    filled: Vec<bool>,
+    filled_count: usize,
+    /// Time until every row had its metadata.
+    details: Option<Duration>,
+    /// Row id -> index in `rows` (rebuilt after sorting).
+    pos: Vec<u32>,
+    /// Feeds the metadata worker; dropping it stops the worker.
+    backfill: Option<Sender<Fill>>,
+    /// Ids last sent as visible, to avoid resending every frame.
+    prioritized: Vec<u32>,
+}
+
+impl Results {
+    fn reindex(&mut self) {
+        self.pos.resize(self.rows.len(), 0);
+        for (i, r) in self.rows.iter().enumerate() {
+            self.pos[r.id as usize] = i as u32;
+        }
+    }
+
+    fn is_filled(&self, row: &Row) -> bool {
+        self.filled.get(row.id as usize).copied().unwrap_or(true)
+    }
+}
+
+/// A result row's folder and name, as the backfill worker needs them.
+type RowKey = (Arc<[u8]>, Box<[u8]>);
+
+/// Work for the metadata backfill worker.
+enum Fill {
+    /// New rows (id, folder, name), in display order.
+    Add(Vec<(u32, RowKey)>),
+    /// Rows on screen now: done before anything else.
+    Prioritize(Vec<u32>),
+}
+
+/// Rows statted per round; visible rows jump the queue between rounds.
+const FILL_BATCH: usize = 2048;
+
+/// Stat result rows in the background, visible rows first, and report
+/// sizes and dates in batches. Ends when the search is replaced (its
+/// channel closes or the generation moves on).
+fn backfill(generation: u64, current: Arc<AtomicU64>, rx: Receiver<Fill>, tx: Sender<Msg>, ctx: egui::Context) {
+    use std::collections::VecDeque;
+    use std::sync::mpsc::TryRecvError;
+    let mut keys: Vec<Option<RowKey>> = Vec::new();
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    let mut urgent: Vec<u32> = Vec::new();
+    let take = |f: Fill, keys: &mut Vec<Option<RowKey>>, queue: &mut VecDeque<u32>, urgent: &mut Vec<u32>| match f {
+        Fill::Add(rows) => {
+            for (id, key) in rows {
+                if keys.len() <= id as usize {
+                    keys.resize(id as usize + 1, None);
+                }
+                keys[id as usize] = Some(key);
+                queue.push_back(id);
+            }
+        }
+        Fill::Prioritize(ids) => *urgent = ids,
+    };
+    loop {
+        // Block only when there's nothing to do.
+        if queue.is_empty() && urgent.is_empty() {
+            match rx.recv() {
+                Ok(f) => take(f, &mut keys, &mut queue, &mut urgent),
+                Err(_) => return,
+            }
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(f) => take(f, &mut keys, &mut queue, &mut urgent),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if current.load(Relaxed) != generation {
+            return;
+        }
+        fn pick(id: u32, keys: &mut [Option<RowKey>], batch: &mut Vec<Row>) {
+            if let Some((dir, name)) = keys.get_mut(id as usize).and_then(Option::take) {
+                batch.push(Row { name, dir: Some(dir), size: 0, mtime: 0, flags: 0, sel: false, id });
+            }
+        }
+        let mut batch: Vec<Row> = Vec::with_capacity(FILL_BATCH);
+        for id in std::mem::take(&mut urgent) {
+            pick(id, &mut keys, &mut batch);
+        }
+        while batch.len() < FILL_BATCH {
+            let Some(id) = queue.pop_front() else { break };
+            pick(id, &mut keys, &mut batch);
+        }
+        if batch.is_empty() {
+            continue;
+        }
+        // Rows of one folder side by side share an open handle.
+        batch.sort_unstable_by(|a, b| a.dir.as_deref().cmp(&b.dir.as_deref()));
+        fsys::fill_meta(&mut batch);
+        let filled = batch.into_iter().map(|r| (r.id, r.size, r.mtime)).collect();
+        if tx.send(Msg::Meta { generation, filled }).is_err() {
+            return;
+        }
+        ctx.request_repaint();
+    }
 }
 
 struct TypeAhead {
@@ -256,6 +370,9 @@ impl App {
         let keep = self.focus_path();
         let (key, desc) = (self.sort, self.descending);
         fsys::sort_rows(self.source_mut(), key, desc);
+        if let Some(r) = self.results.as_mut() {
+            r.reindex();
+        }
         self.rebuild_view(keep);
         self.scroll_to = self.focus;
     }
@@ -462,30 +579,44 @@ impl App {
     }
 
     /// Ask the daemon: its index is always ready and current, so there is no
-    /// crawl. Rows come back without metadata; statting them here, as the
-    /// user, also confirms each result is still there and accessible.
+    /// crawl. The first screenful arrives sorted and is shown at once; the
+    /// rest streams in behind it. Rows come without metadata, which is
+    /// backfilled here, as the user.
     fn run_daemon_query(&mut self) {
         let generation = self.query_gen.fetch_add(1, Relaxed) + 1;
         self.searching = true;
         let current = self.query_gen.clone();
         let (scope, text, regex, tx, ctx) = (self.cwd.clone(), self.query.clone(), self.regex, self.tx.clone(), self.ctx.clone());
-        let (sort, desc) = (self.sort, self.descending);
+        let order = match (self.sort, self.descending) {
+            (SortKey::Name, false) => proto::NAME_ASC,
+            (SortKey::Name, true) => proto::NAME_DESC,
+            _ => proto::UNORDERED, // sizes and dates aren't known yet
+        };
         thread::spawn(move || {
             let t = Instant::now();
-            let reply = proto::query(&scope, &text, regex, MAX_RESULTS as u32);
-            let query = t.elapsed();
-            let msg = match reply {
-                Ok(proto::Reply::Rows { mut rows, total }) => {
-                    let t = Instant::now();
-                    fsys::fill_meta(&mut rows);
-                    fsys::sort_rows(&mut rows, sort, desc);
-                    Msg::Results { generation, rows, total, query, meta: t.elapsed() }
-                }
-                _ => Msg::DaemonFailed { generation },
-            };
-            if current.load(Relaxed) == generation {
-                let _ = tx.send(msg);
+            let send = |msg: Msg| {
+                let ok = current.load(Relaxed) == generation && tx.send(msg).is_ok();
                 ctx.request_repaint();
+                ok
+            };
+            match proto::query(&scope, &text, regex, MAX_RESULTS as u32, order, SCREENFUL) {
+                Ok(proto::Reply::Rows { rows, total, mut rest }) => {
+                    if !send(Msg::Results { generation, rows, total, first: t.elapsed(), complete: false }) {
+                        return;
+                    }
+                    loop {
+                        let (rows, complete) = match rest.next() {
+                            Ok(Some(rows)) => (rows, false),
+                            Ok(None) | Err(_) => (Vec::new(), true),
+                        };
+                        if !send(Msg::MoreRows { generation, rows, complete }) || complete {
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    send(Msg::DaemonFailed { generation });
+                }
             }
         });
     }
@@ -495,23 +626,60 @@ impl App {
         self.searching = true;
         let current = self.query_gen.clone();
         let (scope, tx, ctx) = (self.cwd.clone(), self.tx.clone(), self.ctx.clone());
-        let (sort, desc) = (self.sort, self.descending);
         thread::spawn(move || {
             let t = Instant::now();
             let cancelled = || current.load(Relaxed) != generation;
-            let Some((mut rows, total)) = index.query(&m, &scope, MAX_RESULTS, &cancelled) else { return };
-            let query = t.elapsed();
-            let t = Instant::now();
-            if !index.with_meta {
-                fsys::fill_meta(&mut rows);
-            }
-            fsys::sort_rows(&mut rows, sort, desc);
-            let meta = t.elapsed();
+            let Some((rows, total)) = index.query(&m, &scope, MAX_RESULTS, &cancelled) else { return };
             if !cancelled() {
-                let _ = tx.send(Msg::Results { generation, rows, total, query, meta });
+                let _ = tx.send(Msg::Results { generation, rows, total, first: t.elapsed(), complete: true });
                 ctx.request_repaint();
             }
         });
+    }
+
+    /// Give arriving rows ids, sort, and queue them for metadata.
+    fn add_result_rows(&mut self, mut rows: Vec<Row>) {
+        let Some(r) = self.results.as_mut() else { return };
+        let base = r.rows.len() as u32;
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.id = base + i as u32;
+        }
+        let known = rows.iter().filter(|row| row.size != 0 || row.mtime != 0).count();
+        r.filled.extend(rows.iter().map(|row| row.size != 0 || row.mtime != 0));
+        r.filled_count += known;
+        if let Some(b) = &r.backfill {
+            let _ = b.send(Fill::Add(rows.iter().filter(|row| row.size == 0 && row.mtime == 0).map(|row| (row.id, (row.dir.clone().unwrap_or_else(|| self.cwd.as_slice().into()), row.name.clone()))).collect()));
+        }
+        r.rows.extend(rows);
+        let keep = self.focus_path();
+        let (key, desc) = (self.sort, self.descending);
+        if let Some(r) = self.results.as_mut() {
+            fsys::sort_rows(&mut r.rows, key, desc);
+            r.reindex();
+        }
+        self.rebuild_view(keep);
+    }
+
+    fn apply_meta(&mut self, filled: Vec<(u32, u64, i64)>) {
+        let Some(r) = self.results.as_mut() else { return };
+        for (id, size, mtime) in filled {
+            let (Some(&p), Some(f)) = (r.pos.get(id as usize), r.filled.get_mut(id as usize)) else { continue };
+            let row = &mut r.rows[p as usize];
+            row.size = if row.is_dir() { 0 } else { size };
+            row.mtime = mtime;
+            if !*f {
+                *f = true;
+                r.filled_count += 1;
+            }
+        }
+        if r.all.is_some() && r.details.is_none() && r.filled_count >= r.rows.len() {
+            r.details = Some(r.started.elapsed());
+            r.backfill = None;
+            // Order by size or date only once every row has one.
+            if matches!(self.sort, SortKey::Size | SortKey::Modified) {
+                self.resort();
+            }
+        }
     }
 
     fn drain_messages(&mut self) {
@@ -545,12 +713,39 @@ impl App {
                     }
                 }
                 Msg::Built(None) => {}
-                Msg::Results { generation, rows, total, query, meta } if generation == self.query_gen.load(Relaxed) => {
+                Msg::Results { generation, rows, total, first, complete } if generation == self.query_gen.load(Relaxed) => {
                     self.searching = false;
-                    self.results = Some(Results { rows, total, query, meta });
-                    self.rebuild_view(None);
+                    let (fill_tx, fill_rx) = channel();
+                    let (current, tx, ctx) = (self.query_gen.clone(), self.tx.clone(), self.ctx.clone());
+                    thread::spawn(move || backfill(generation, current, fill_rx, tx, ctx));
+                    self.results = Some(Results {
+                        rows: Vec::new(),
+                        total,
+                        started: Instant::now() - first,
+                        first,
+                        all: complete.then_some(first),
+                        filled: Vec::new(),
+                        filled_count: 0,
+                        details: None,
+                        pos: Vec::new(),
+                        backfill: Some(fill_tx),
+                        prioritized: Vec::new(),
+                    });
+                    self.add_result_rows(rows);
+                    self.focus = None;
                     self.scroll_to = Some(0);
+                    if complete {
+                        self.apply_meta(Vec::new());
+                    }
                 }
+                Msg::MoreRows { generation, rows, complete } if generation == self.query_gen.load(Relaxed) => {
+                    self.add_result_rows(rows);
+                    if let (true, Some(r)) = (complete, self.results.as_mut()) {
+                        r.all = Some(r.started.elapsed());
+                    }
+                    self.apply_meta(Vec::new());
+                }
+                Msg::Meta { generation, filled } if generation == self.query_gen.load(Relaxed) => self.apply_meta(filled),
                 Msg::Fonts(name) => self.font = name,
                 Msg::Daemon(st) => {
                     self.daemon_failed = false;
@@ -845,13 +1040,19 @@ impl App {
             } else if let Some(b) = &self.build {
                 ui.label(format!("Indexing {} … {} entries", String::from_utf8_lossy(&b.root), b.seen.load(Relaxed)));
             } else if let Some(r) = &self.results {
-                let shown = if r.total > r.rows.len() { format!(" (showing {})", r.rows.len()) } else { String::new() };
-                ui.label(format!(
-                    "{} matches{shown}{sel} · query {:.1} ms + metadata {:.1} ms",
-                    r.total,
-                    r.query.as_secs_f64() * 1e3,
-                    r.meta.as_secs_f64() * 1e3
-                ));
+                let msec = |d: Duration| format!("{:.1} ms", d.as_secs_f64() * 1e3);
+                let shown = match r.all {
+                    None => format!(" · receiving {} rows", r.rows.len()),
+                    Some(_) if r.total > r.rows.len() => format!(" (showing {})", r.rows.len()),
+                    Some(_) => String::new(),
+                };
+                let all = r.all.map_or(String::new(), |d| format!(" · all rows {}", msec(d)));
+                let details = match r.details {
+                    Some(d) => format!(" · details {}", msec(d)),
+                    None if !r.rows.is_empty() => format!(" · details {}%", r.filled_count * 100 / r.rows.len()),
+                    None => String::new(),
+                };
+                ui.label(format!("{} matches{shown}{sel} · first rows {}{all}{details}", r.total, msec(r.first)));
             } else if let Some(e) = &self.error {
                 ui.colored_label(RED, e);
             } else if self.loading {
@@ -960,7 +1161,9 @@ impl App {
         let typeahead_hit = self.typeahead.as_ref().filter(|t| t.last.elapsed() < TYPEAHEAD_RESET && !t.positions.is_empty());
         let mut clicked: Option<(usize, bool)> = None; // (view index, double)
         ui.spacing_mut().item_spacing.y = 0.0;
+        let mut visible = 0..0;
         let out = area.show_rows(ui, ROW_H, self.view.len(), |ui, range| {
+            visible = range.clone();
             for vi in range {
                 let Some(row) = self.row(vi) else { continue };
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::click());
@@ -986,6 +1189,8 @@ impl App {
                     (false, false) => "🗋",
                 };
                 let full = row.full_path(&self.cwd);
+                // Sizes and dates of results stay blank until backfilled.
+                let known = self.results.as_ref().is_none_or(|r| r.is_filled(row));
                 for &(label, _, cx, w, right) in &cols {
                     let r = Rect::from_min_size(egui::pos2(rect.left() + cx, rect.top()), egui::vec2(w, ROW_H));
                     match label {
@@ -994,9 +1199,9 @@ impl App {
                             None => cell(painter, r, &format!("{icon}  {}", row.display()), &font, color, false),
                         },
                         "Folder" => cell(painter, r, &String::from_utf8_lossy(row.dir.as_deref().unwrap_or(&self.cwd)), &font, weak, false),
-                        "Date modified" => cell(painter, r, &sys::format_time(row.mtime), &font, weak, false),
+                        "Date modified" if known => cell(painter, r, &sys::format_time(row.mtime), &font, weak, false),
                         "Type" => cell(painter, r, &row.type_name(), &font, weak, false),
-                        "Size" if !row.is_dir() => cell(painter, r, &fsys::format_size(row.size), &font, weak, right),
+                        "Size" if known && !row.is_dir() => cell(painter, r, &fsys::format_size(row.size), &font, weak, right),
                         _ => {}
                     }
                 }
@@ -1023,6 +1228,7 @@ impl App {
             }
         });
         self.scroll_y = out.state.clamped_offset().y;
+        self.prioritize_visible(visible);
         self.view_h = out.inner_rect.height();
         match clicked {
             Some((vi, true)) => action = Some(Action::Open(vi)),
@@ -1036,6 +1242,23 @@ impl App {
         }
         self.typeahead_overlay(ui);
         self.run_action(action);
+    }
+
+    /// Ask the backfill worker for the rows on screen first.
+    fn prioritize_visible(&mut self, visible: std::ops::Range<usize>) {
+        let missing: Vec<u32> = visible
+            .filter_map(|vi| self.row(vi))
+            .filter(|row| self.results.as_ref().is_some_and(|r| !r.is_filled(row)))
+            .map(|row| row.id)
+            .collect();
+        if let Some(r) = self.results.as_mut()
+            && !missing.is_empty()
+            && missing != r.prioritized
+            && let Some(b) = &r.backfill
+        {
+            let _ = b.send(Fill::Prioritize(missing.clone()));
+            r.prioritized = missing;
+        }
     }
 
     fn typeahead_overlay(&self, ui: &Ui) {

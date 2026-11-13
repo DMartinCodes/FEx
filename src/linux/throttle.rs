@@ -10,25 +10,72 @@
 //!   pressure, background work pauses between folders.
 //! * Power: on battery, background work pauses.
 //!
+//! * Reserve: `SCHED_IDLE` gets nothing on a machine that is always fully
+//!   loaded, so a first crawl there would never finish. A controller
+//!   measures the CPU time background threads actually get (their own
+//!   thread clocks, so queries don't count) and, while that is below the
+//!   reserve (`profile.rs`: 0.5% to 5% of total capacity), steps them up
+//!   through nice 19, 15, 10, 5, 0 under the normal scheduler; once they get
+//!   enough, back down to `SCHED_IDLE`. On an idle machine they never leave
+//!   `SCHED_IDLE`, which already gives them everything.
+//!
 //! Queries never run on these threads: answering a user stays at normal
 //! priority, because speed is the point.
 
+use std::cell::Cell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
+/// Background priority steps: `SCHED_IDLE`, then these nice values.
+const NICE_STEPS: [i32; 5] = [19, 15, 10, 5, 0];
+
+/// Put the calling thread at background step `step` (0 = idle CPU and I/O
+/// priority; higher = the normal scheduler at `NICE_STEPS[step - 1]`, with
+/// the lowest best-effort I/O priority). Per thread on Linux.
+fn set_step(step: usize) {
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_BE: libc::c_long = 2;
+    const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+    let param = libc::sched_param { sched_priority: 0 };
+    unsafe {
+        if step == 0 {
+            libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+            libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0 as libc::c_long, IOPRIO_CLASS_IDLE << 13);
+        } else {
+            libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
+            libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, NICE_STEPS[step - 1]);
+            libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0 as libc::c_long, (IOPRIO_CLASS_BE << 13) | 7);
+        }
+    }
+}
+
+thread_local! {
+    /// This thread's CPU time when it last reported, and its current step.
+    static LAST_CPU: Cell<u64> = const { Cell::new(0) };
+    static STEP: Cell<usize> = const { Cell::new(0) };
+}
+
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+fn mono_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 /// Lower the calling thread to idle CPU and I/O priority (per thread on
 /// Linux, so the rest of the process is unaffected).
 pub fn background_thread() {
-    unsafe {
-        let param = libc::sched_param { sched_priority: 0 };
-        libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
-        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
-        const IOPRIO_CLASS_IDLE: libc::c_long = 3;
-        libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0 as libc::c_long, IOPRIO_CLASS_IDLE << 13);
-    }
+    set_step(0);
+    STEP.with(|s| s.set(0));
+    LAST_CPU.with(|c| c.set(thread_cpu_ns()));
 }
 
 /// `some avg10` from a PSI file: percent of the last 10 s in which at least
@@ -70,13 +117,66 @@ pub struct Throttle {
     /// Pause when others' I/O stall share (PSI some avg10) exceeds this.
     io_limit: f64,
     pub own_cgroup: bool,
+    /// Share of total CPU capacity guaranteed to background work (0 = none),
+    /// as f64 bits so it can change once the real file count is known.
+    reserve: AtomicU64,
+    cores: usize,
+    /// CPU time background threads have used (ns, cumulative).
+    used_ns: AtomicU64,
+    /// When a background thread last paced (monotonic ns): work is pending.
+    last_pace: AtomicU64,
+    /// Current background step (see `set_step`), set by the controller.
+    step: AtomicUsize,
+    /// Background share of total CPU over the last second or so.
+    share_ppm: AtomicU64,
 }
 
 impl Throttle {
-    /// Start watching pressure and power every half second.
-    pub fn start(io_limit: f64) -> Arc<Throttle> {
+    /// Start watching pressure and power every half second, and enforce
+    /// `reserve` (a share of total CPU capacity across `cores`) every 100 ms.
+    pub fn start(io_limit: f64, reserve: f64, cores: usize) -> Arc<Throttle> {
         let cgroup = own_cgroup();
-        let t = Arc::new(Throttle { paused: AtomicBool::new(false), reason: Mutex::new(String::new()), io_limit, own_cgroup: cgroup.is_some() });
+        let t = Arc::new(Throttle {
+            paused: AtomicBool::new(false),
+            reason: Mutex::new(String::new()),
+            io_limit,
+            own_cgroup: cgroup.is_some(),
+            reserve: AtomicU64::new(reserve.to_bits()),
+            cores: cores.max(1),
+            used_ns: AtomicU64::new(0),
+            last_pace: AtomicU64::new(0),
+            step: AtomicUsize::new(0),
+            share_ppm: AtomicU64::new(0),
+        });
+        let w = Arc::downgrade(&t);
+        thread::Builder::new()
+            .name("fex-reserve".into())
+            .spawn(move || {
+                let (mut used, mut at, mut ewma) = (0u64, mono_ns(), 0.0f64);
+                while let Some(t) = w.upgrade() {
+                    let (u, now) = (t.used_ns.load(Relaxed), mono_ns());
+                    let share = (u - used) as f64 / ((now - at).max(1) as f64 * t.cores as f64);
+                    (used, at) = (u, now);
+                    ewma = 0.6 * ewma + 0.4 * share;
+                    t.share_ppm.store((ewma * 1e6) as u64, Relaxed);
+                    let active = now.saturating_sub(t.last_pace.load(Relaxed)) < 300_000_000;
+                    let step = t.step.load(Relaxed);
+                    let reserve = t.reserve();
+                    let next = if !active || reserve <= 0.0 {
+                        0
+                    } else if ewma < reserve * 0.8 {
+                        (step + 1).min(NICE_STEPS.len())
+                    } else if ewma > reserve * 1.3 {
+                        step.saturating_sub(1)
+                    } else {
+                        step
+                    };
+                    t.step.store(next, Relaxed);
+                    drop(t);
+                    thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .ok();
         let w = Arc::downgrade(&t);
         thread::Builder::new()
             .name("fex-throttle".into())
@@ -113,10 +213,40 @@ impl Throttle {
         *self.reason.lock().unwrap_or_else(PoisonError::into_inner) = why.unwrap_or_default();
     }
 
-    /// Block while paused (called by background threads between folders).
+    /// Called by background threads between folders: report CPU used,
+    /// take on the controller's current step, and block while paused.
     pub fn wait(&self) {
+        let now = thread_cpu_ns();
+        let last = LAST_CPU.with(|c| c.replace(now));
+        if last != 0 {
+            self.used_ns.fetch_add(now.saturating_sub(last), Relaxed);
+        }
+        self.last_pace.store(mono_ns(), Relaxed);
+        let step = self.step.load(Relaxed);
+        if STEP.with(|s| s.replace(step)) != step {
+            set_step(step);
+        }
         while self.paused.load(Relaxed) {
             thread::sleep(Duration::from_millis(250));
+            LAST_CPU.with(|c| c.set(thread_cpu_ns()));
+        }
+    }
+
+    pub fn reserve(&self) -> f64 {
+        f64::from_bits(self.reserve.load(Relaxed))
+    }
+
+    pub fn set_reserve(&self, r: f64) {
+        self.reserve.store(r.to_bits(), Relaxed);
+    }
+
+    /// Background CPU share and priority, for status displays.
+    pub fn reserve_state(&self) -> String {
+        let reserve = self.reserve();
+        let share = self.share_ppm.load(Relaxed) as f64 / 1e4;
+        match self.step.load(Relaxed) {
+            0 => format!("idle priority, {share:.2}% of CPU (reserve {:.2}%)", reserve * 100.0),
+            s => format!("raised to nice {} to keep the {:.2}% reserve ({share:.2}% now)", NICE_STEPS[s - 1], reserve * 100.0),
         }
     }
 

@@ -20,6 +20,9 @@ pub struct Row {
     pub mtime: i64,
     pub flags: u8,
     pub sel: bool,
+    /// Position in a result set as it arrived, so metadata filled in later
+    /// finds its row after sorting. 0 outside search results.
+    pub id: u32,
 }
 
 impl Row {
@@ -145,7 +148,7 @@ pub fn list_dir(path: &[u8]) -> Result<Vec<Row>, String> {
     let dir = Dir::open(path).map_err(fail)?;
     let mut rows = Vec::new();
     dir.scan(&mut Vec::new(), |e| {
-        rows.push(Row { name: e.name.into(), dir: None, size: 0, mtime: 0, flags: e.flags, sel: false });
+        rows.push(Row { name: e.name.into(), dir: None, size: 0, mtime: 0, flags: e.flags, sel: false, id: 0 });
     })
     .map_err(fail)?;
     let fill = |row: &mut Row| {

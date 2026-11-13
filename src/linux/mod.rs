@@ -11,6 +11,7 @@ mod daemon;
 mod fanotify;
 mod fsys;
 mod index;
+mod profile;
 mod proto;
 mod snapshot;
 mod sys;
@@ -26,10 +27,11 @@ use eframe::egui;
 
 const USAGE: &str = "usage: fex [folder]
        fex daemon [--root /] [--state-dir /var/lib/fex] [--socket PATH] [--workers N]
-                  [--sweep-every SECS] [--save-every SECS] [--io-limit PCT]
+                  [--sweep-every SECS] [--save-every SECS] [--io-limit PCT] [--reserve PCT]
                   [--no-fanotify] [--include-network]
        fex query [--regex] [--scope DIR] [--limit N] [--show N] <text>
        fex status
+       fex profile [--root /] [--state-dir /var/lib/fex] [--save]
        fex --bench <folder> [--runs N] [query ...]
            query: keywords (globs with * ?, type:ext), or re:<regex>
        fex --bench-interference <folder> [--secs N]
@@ -82,6 +84,7 @@ pub fn main() -> ExitCode {
         Some("daemon") => cli_daemon(&args[1..]),
         Some("query") => cli_query(&args[1..]),
         Some("status") => cli_status(),
+        Some("profile") => cli_profile(&args[1..]),
         _ => gui(args.into_iter().next()),
     }
 }
@@ -277,6 +280,7 @@ fn cli_daemon(args: &[String]) -> ExitCode {
         include_network: false,
         workers: walk::cores(),
         io_limit: 10.0,
+        reserve: None,
     };
     let mut it = args.iter();
     let parsed: Result<(), String> = (|| {
@@ -290,6 +294,10 @@ fn cli_daemon(args: &[String]) -> ExitCode {
                 "--save-every" => cfg.save_every = secs(arg_value(&mut it, a)?)?,
                 "--workers" => cfg.workers = arg_value(&mut it, a)?.parse().map_err(|_| "--workers: expected a number")?,
                 "--io-limit" => cfg.io_limit = arg_value(&mut it, a)?.parse().map_err(|_| "--io-limit: expected a percentage")?,
+                "--reserve" => {
+                    let pct: f64 = arg_value(&mut it, a)?.parse().map_err(|_| "--reserve: expected a percentage")?;
+                    cfg.reserve = Some((pct / 100.0).clamp(0.0, 0.5));
+                }
                 "--no-fanotify" => cfg.fanotify = false,
                 "--include-network" => cfg.include_network = true,
                 other => return Err(format!("unknown option {other}")),
@@ -303,6 +311,9 @@ fn cli_daemon(args: &[String]) -> ExitCode {
     }
     daemon::run(cfg)
 }
+
+/// Rows in the first chunk of a streamed reply: a tall window's worth.
+const SCREENFUL: u32 = 200;
 
 fn cli_query(args: &[String]) -> ExitCode {
     let (mut regex, mut limit, mut show) = (false, proto::MAX_LIMIT, 20usize);
@@ -321,18 +332,29 @@ fn cli_query(args: &[String]) -> ExitCode {
     let cwd = std::env::current_dir().map(|d| d.as_os_str().as_bytes().to_vec()).unwrap_or_else(|_| b"/".to_vec());
     let scope = scope.map_or(b"/".to_vec(), |s| fsys::resolve_input(&s, &cwd));
     let t = Instant::now();
-    match proto::query(&scope, &words.join(" "), regex, limit) {
+    match proto::query(&scope, &words.join(" "), regex, limit, proto::NAME_ASC, SCREENFUL) {
         Err(e) => {
             eprintln!("no index daemon at {}: {e}", proto::socket_path().display());
             ExitCode::FAILURE
         }
-        Ok(proto::Reply::Rows { mut rows, total }) => {
-            let asked = t.elapsed();
+        Ok(proto::Reply::Rows { mut rows, total, rest }) => {
+            let first = t.elapsed();
+            let shown: Vec<fsys::Row> = rows.iter().take(show).cloned().collect();
+            if let Err(e) = rest.collect_into(&mut rows) {
+                eprintln!("reply cut short: {e}");
+            }
+            let all = t.elapsed();
             let t = Instant::now();
             fsys::fill_meta(&mut rows);
             let meta = t.elapsed();
-            println!("{total} matches ({} rows) in {} round trip + {} metadata", rows.len(), ms(asked), ms(meta));
-            for r in rows.iter().take(show) {
+            println!(
+                "{total} matches · first screen in {} · all {} rows in {} · metadata {}",
+                ms(first),
+                rows.len(),
+                ms(all),
+                ms(meta)
+            );
+            for r in &shown {
                 println!("{}", String::from_utf8_lossy(&r.full_path(b"")));
             }
             ExitCode::SUCCESS
@@ -365,9 +387,44 @@ fn cli_status() -> ExitCode {
             println!("verified:  {age} s ago");
             println!("watching:  {}", if st.watched > 0 { format!("{} filesystem(s) with fanotify", st.watched) } else { "periodic sweeps only".into() });
             println!("activity:  {}{}", st.activity, if st.paused.is_empty() { String::new() } else { format!(" (paused: {})", st.paused) });
+            if !st.reserve.is_empty() {
+                println!("cpu:       {}", st.reserve);
+            }
             ExitCode::SUCCESS
         }
     }
+}
+
+/// Measure this machine and show (and with --save, store) the reserve the
+/// daemon would use. Run at install; the daemon also does it on first start.
+fn cli_profile(args: &[String]) -> ExitCode {
+    let (mut root, mut state, mut save) = (b"/".to_vec(), std::path::PathBuf::from("/var/lib/fex"), false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--root" => root = it.next().map_or(root, |r| fsys::resolve_input(r, b"/")),
+            "--state-dir" => state = it.next().map_or(state, std::path::PathBuf::from),
+            "--save" => save = true,
+            other => {
+                eprintln!("unknown option {other}\n{USAGE}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let skip: std::collections::HashSet<Vec<u8>> = sys::crawl_skips();
+    let p = profile::measure(&root, &skip, None);
+    println!("{}", p.describe());
+    if save {
+        let _ = std::fs::create_dir_all(&state);
+        match p.save(&state.join("profile")) {
+            Ok(()) => println!("saved to {}", state.join("profile").display()),
+            Err(e) => {
+                eprintln!("{}: {e}", state.join("profile").display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 // ------------------------------------------------------------ snapshot benchmark
@@ -536,7 +593,9 @@ fn bench_interference(args: &[String]) -> ExitCode {
 
     // (job iterations per second, crawler entries per second)
     let (skip, root) = (&skip, &root);
-    let phase = |job: bool, crawler: Option<bool>| -> (f64, f64) {
+    // crawler: None, or Some(reserve): Some(-1.0) normal priority, Some(0.0)
+    // idle priority alone, Some(r) idle priority with an r reserve.
+    let phase = |job: bool, crawler: Option<f64>| -> (f64, f64) {
         let (stop, work, entries) = (&AtomicBool::new(false), &AtomicU64::new(0), &AtomicUsize::new(0));
         std::thread::scope(|sc| {
             if job {
@@ -552,15 +611,17 @@ fn bench_interference(args: &[String]) -> ExitCode {
                     });
                 }
             }
-            if let Some(idle) = crawler {
+            if let Some(reserve) = crawler {
                 sc.spawn(move || {
+                    let idle = reserve >= 0.0;
+                    let t = throttle::Throttle::start(f64::INFINITY, reserve.max(0.0), cores);
+                    let pace = || t.wait();
                     let init: &(dyn Fn() + Sync) = if idle { &throttle::background_thread } else { &|| {} };
+                    let pace: &(dyn Fn() + Sync) = if idle { &pace } else { &|| {} };
+                    // Progress counts every entry seen, finished crawl or not.
                     while !stop.load(Relaxed) {
-                        let seen = AtomicUsize::new(0);
-                        let c = index::Crawl { workers: cores, cancel: stop, skip, with_meta: false, seen: &seen, init, pace: &|| {} };
-                        if let Some(idx) = index::build(root, &c) {
-                            entries.fetch_add(idx.entries, Relaxed);
-                        }
+                        let c = index::Crawl { workers: cores, cancel: stop, skip, with_meta: false, seen: entries, init, pace };
+                        let _ = index::build(root, &c);
                     }
                 });
             }
@@ -571,13 +632,18 @@ fn bench_interference(args: &[String]) -> ExitCode {
     };
     println!("FEx interference benchmark: crawling {} on {cores} threads, {secs} s per phase, warm cache\n", String::from_utf8_lossy(root));
     let (base, _) = phase(true, None);
-    println!("{:<44} {:>14} {:>16}", "phase", "job (rel.)", "crawl M ent./s");
-    println!("{:<44} {:>14} {:>16}", "job alone", "100.0%", "-");
-    for (label, idle) in [("job + crawler at normal priority", false), ("job + crawler at idle priority (daemon)", true)] {
-        let (job, crawl) = phase(true, Some(idle));
-        println!("{label:<44} {:>13.1}% {:>16.2}", job / base * 100.0, crawl / 1e6);
+    let (_, alone) = phase(false, Some(0.0));
+    println!("{:<46} {:>12} {:>16} {:>14}", "phase", "job (rel.)", "crawl M ent./s", "crawl share");
+    println!("{:<46} {:>12} {:>16} {:>14}", "job alone", "100.0%", "-", "-");
+    for (label, reserve) in [
+        ("job + crawler, normal priority", -1.0),
+        ("job + crawler, idle priority, no reserve", 0.0),
+        ("job + crawler, idle priority, 0.5% reserve", 0.005),
+        ("job + crawler, idle priority, 5% reserve", 0.05),
+    ] {
+        let (job, crawl) = phase(true, Some(reserve));
+        println!("{label:<46} {:>11.1}% {:>16.3} {:>13.2}%", job / base * 100.0, crawl / 1e6, crawl / alone * 100.0);
     }
-    let (_, crawl) = phase(false, Some(true));
-    println!("{:<44} {:>14} {:>16.2}", "idle-priority crawler alone", "-", crawl / 1e6);
+    println!("{:<46} {:>12} {:>16.3} {:>14}", "idle-priority crawler alone", "-", alone / 1e6, "100%");
     ExitCode::SUCCESS
 }

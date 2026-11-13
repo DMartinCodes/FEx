@@ -3,12 +3,18 @@
 //! u32 length followed by the bytes (paths are bytes, never decoded).
 //!
 //! ```text
-//! request:  op u8 = QUERY, regex u8, limit u32, scope bytes, query bytes
+//! request:  op u8 = QUERY, regex u8, limit u32, scope bytes, query bytes,
+//!           order u8 (NAME_ASC / NAME_DESC / UNORDERED), first u32
 //!           op u8 = STATUS
-//! query reply:  OK, total u64, folders u32 x bytes, rows u32 x (folder u32, flags u8, name bytes)
+//! query reply:  OK, total u64, then chunks until one has `last` set
 //!               NOT_COVERED, root bytes  |  ERROR, message bytes  |  BUSY, message bytes
+//! chunk (one message each): last u8, new folders u32 x bytes,
+//!               rows u32 x (folder u32, flags u8, name bytes)
 //! status reply: OK, then the `Status` fields in order
 //! ```
+//! Streaming: the first chunk holds the `first` rows that sort first by the
+//! requested order (a screenful), so the client can show them while the rest
+//! arrive; folder ids count up across chunks, each path sent once.
 //! Rows carry no sizes or dates: the client stats what it shows, as the
 //! user, which is also the final permission check.
 
@@ -111,12 +117,67 @@ pub fn recv(stream: &mut UnixStream, max: usize) -> io::Result<Vec<u8>> {
 
 // ------------------------------------------------------------ client
 
+/// Row order the client wants first (see `QUERY`).
+pub const NAME_ASC: u8 = 0;
+pub const NAME_DESC: u8 = 1;
+pub const UNORDERED: u8 = 2;
+
 pub enum Reply {
-    Rows { rows: Vec<Row>, total: usize },
+    /// The first chunk and the exact match count; `rest` yields the others.
+    Rows { rows: Vec<Row>, total: usize, rest: Stream },
     /// The daemon's index doesn't cover the scope (its root is given).
     NotCovered(Vec<u8>),
     Busy(String),
     Error(String),
+}
+
+/// The remaining chunks of a streamed reply.
+pub struct Stream {
+    s: Option<UnixStream>,
+    dirs: Vec<Arc<[u8]>>,
+}
+
+impl Stream {
+    fn chunk(&mut self, body: &[u8], skip_header: bool) -> io::Result<Vec<Row>> {
+        let mut r = Reader::new(body);
+        if skip_header {
+            r.u8()?;
+            r.u64()?;
+        }
+        let last = r.u8()? != 0;
+        let nd = r.u32()? as usize;
+        for _ in 0..nd {
+            self.dirs.push(r.bytes()?.into());
+        }
+        let n = r.u32()? as usize;
+        let mut rows = Vec::with_capacity(n.min(MAX_LIMIT as usize));
+        for _ in 0..n {
+            let d = r.u32()? as usize;
+            let flags = r.u8()?;
+            let name = r.bytes()?;
+            let dir = self.dirs.get(d).cloned().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad folder index"))?;
+            rows.push(Row { name: name.into(), dir: Some(dir), size: 0, mtime: 0, flags, sel: false, id: 0 });
+        }
+        if last {
+            self.s = None;
+        }
+        Ok(rows)
+    }
+
+    /// The next chunk, or `None` once the reply is complete.
+    pub fn next(&mut self) -> io::Result<Option<Vec<Row>>> {
+        let Some(s) = self.s.as_mut() else { return Ok(None) };
+        let body = recv(s, usize::MAX >> 1)?;
+        self.chunk(&body, false).map(Some)
+    }
+
+    /// Everything that's left, in one vector.
+    pub fn collect_into(mut self, rows: &mut Vec<Row>) -> io::Result<()> {
+        while let Some(more) = self.next()? {
+            rows.extend(more);
+        }
+        Ok(())
+    }
 }
 
 fn connect() -> io::Result<UnixStream> {
@@ -126,34 +187,25 @@ fn connect() -> io::Result<UnixStream> {
     Ok(s)
 }
 
-/// Ask the daemon for matches under `scope`. `Err` when there is no daemon.
-pub fn query(scope: &[u8], text: &str, regex: bool, limit: u32) -> io::Result<Reply> {
+/// Ask the daemon for matches under `scope`. The reply's first chunk holds
+/// the `first` rows that come first in `order`. `Err` when there is no daemon.
+pub fn query(scope: &[u8], text: &str, regex: bool, limit: u32, order: u8, first: u32) -> io::Result<Reply> {
     let mut s = connect()?;
     let mut req = vec![QUERY, regex as u8];
     put_u32(&mut req, limit.min(MAX_LIMIT));
     put_bytes(&mut req, scope);
     put_bytes(&mut req, text.as_bytes());
+    req.push(order);
+    put_u32(&mut req, first);
     send(&mut s, &req)?;
     let body = recv(&mut s, usize::MAX >> 1)?;
     let mut r = Reader::new(&body);
     match r.u8()? {
         OK => {
             let total = r.u64()? as usize;
-            let nd = r.u32()? as usize;
-            let mut dirs: Vec<Arc<[u8]>> = Vec::with_capacity(nd.min(1 << 20));
-            for _ in 0..nd {
-                dirs.push(r.bytes()?.into());
-            }
-            let n = r.u32()? as usize;
-            let mut rows = Vec::with_capacity(n.min(MAX_LIMIT as usize));
-            for _ in 0..n {
-                let d = r.u32()? as usize;
-                let flags = r.u8()?;
-                let name = r.bytes()?;
-                let dir = dirs.get(d).cloned().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad folder index"))?;
-                rows.push(Row { name: name.into(), dir: Some(dir), size: 0, mtime: 0, flags, sel: false });
-            }
-            Ok(Reply::Rows { rows, total })
+            let mut rest = Stream { s: Some(s), dirs: Vec::new() };
+            let rows = rest.chunk(&body, true)?;
+            Ok(Reply::Rows { rows, total, rest })
         }
         NOT_COVERED => Ok(Reply::NotCovered(r.bytes()?.to_vec())),
         BUSY => Ok(Reply::Busy(String::from_utf8_lossy(r.bytes()?).into_owned())),
@@ -178,6 +230,8 @@ pub struct Status {
     pub activity: String,
     /// Why background work is paused, if it is.
     pub paused: String,
+    /// The CPU reserve and background priority right now.
+    pub reserve: String,
 }
 
 pub fn encode_status(st: &Status) -> Vec<u8> {
@@ -190,6 +244,7 @@ pub fn encode_status(st: &Status) -> Vec<u8> {
     put_u32(&mut out, st.watched);
     put_bytes(&mut out, st.activity.as_bytes());
     put_bytes(&mut out, st.paused.as_bytes());
+    put_bytes(&mut out, st.reserve.as_bytes());
     out
 }
 
@@ -213,5 +268,6 @@ pub fn status() -> io::Result<Status> {
         watched: r.u32()?,
         activity: String::from_utf8_lossy(r.bytes()?).into_owned(),
         paused: String::from_utf8_lossy(r.bytes()?).into_owned(),
+        reserve: r.bytes().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default(),
     })
 }

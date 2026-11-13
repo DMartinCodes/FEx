@@ -131,7 +131,7 @@ fn run(fd: i32, dir: &[u8], stop: &AtomicBool, sink: &dyn Fn(Vec<Change>)) {
                         flags |= DIR;
                     }
                     let size = if flags & DIR != 0 { 0 } else { m.size };
-                    Change::Upsert(Row { name: name.into(), dir: None, size, mtime: m.mtime, flags, sel: false })
+                    Change::Upsert(Row { name: name.into(), dir: None, size, mtime: m.mtime, flags, sel: false, id: 0 })
                 }
                 None => Change::Removed(name.into()),
             })
