@@ -78,6 +78,9 @@ struct Shared {
     /// Running as root: can filter per user. Otherwise serves only its own uid.
     privileged: bool,
     dirty: AtomicBool,
+    /// Per client process, the number of its latest query: a newer query
+    /// (search as you type) makes older ones stop.
+    clients: Mutex<HashMap<i32, Arc<AtomicU64>>>,
 }
 
 fn now_ns() -> u64 {
@@ -186,6 +189,7 @@ pub fn run(cfg: Config) -> ExitCode {
         throttle,
         privileged,
         dirty: AtomicBool::new(false),
+        clients: Mutex::new(HashMap::new()),
     });
 
     if let Some(dir) = cfg.socket.parent() {
@@ -450,6 +454,7 @@ fn maintain(sh: &Shared, cfg: &Config, snap: &Path) {
 // ------------------------------------------------------------ clients
 
 struct Creds {
+    pid: i32,
     uid: u32,
     gid: u32,
     groups: Vec<u32>,
@@ -483,7 +488,7 @@ fn peer_creds(s: &UnixStream) -> Option<Creds> {
             break;
         }
     }
-    Some(Creds { uid: cred.uid, gid: cred.gid, groups })
+    Some(Creds { pid: cred.pid, uid: cred.uid, gid: cred.gid, groups })
 }
 
 thread_local! {
@@ -609,13 +614,26 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 drop(guard);
                 return reply(&mut s, proto::NOT_COVERED, &root);
             }
+            let latest = {
+                let mut clients = sh.clients.lock().unwrap_or_else(PoisonError::into_inner);
+                if clients.len() > 256 {
+                    clients.retain(|_, c| Arc::strong_count(c) > 1);
+                }
+                clients.entry(creds.pid).or_default().clone()
+            };
+            let mine = latest.fetch_add(1, Relaxed) + 1;
+            let cancelled = || latest.load(Relaxed) != mine;
             let hits = if creds.uid == 0 || !sh.privileged {
-                idx.query_hits(&m, &scope, &|| false, &Everything)
+                idx.query_hits(&m, &scope, &cancelled, &Everything)
             } else {
                 let vis = UserVisibility { creds: &creds, cache: (0..idx.dir_slots()).map(|_| AtomicU8::new(0)).collect() };
-                idx.query_hits(&m, &scope, &|| false, &vis)
+                idx.query_hits(&m, &scope, &cancelled, &vis)
             };
-            let mut hits = hits.unwrap_or_default();
+            // Superseded: the client has moved on.
+            let Some(mut hits) = hits else {
+                drop(guard);
+                return;
+            };
             let total = hits.len();
             let desc = order == proto::NAME_DESC;
             // The first screenful, found and sorted in place in the index

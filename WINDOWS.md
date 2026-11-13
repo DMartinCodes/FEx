@@ -5,10 +5,11 @@ never crawls on launch and the first search is instant. It is the Windows
 counterpart of the Linux index daemon (see LINUX.md) and shares its CPU
 reserve policy (`src/reserve.rs`) and message framing (`src/wire.rs`).
 
-**Status: compile-verified only.** It builds for `x86_64-pc-windows-msvc`
-with no warnings and adds no Clippy findings, but it hasn't run on Windows
-yet. The app is unaffected when the service isn't installed: it checks for
-the service's pipe and otherwise searches exactly as before.
+**Status: early testing.** CI builds it on Windows and runs the Windows
+tests, including real-system tests of the permission checks and the change
+journal; the service as a whole has had one round of hands-on testing. The
+app is unaffected when the service isn't installed: it checks for the
+service's pipe and otherwise searches exactly as before.
 
 ## Install
 
@@ -19,14 +20,17 @@ fex service install      & rem install as FExIndex (LocalSystem, delayed auto st
 fex service status       & rem drives, entries, activity, CPU reserve
 fex service query report & rem search through the service from the current folder
 fex service profile      & rem the machine profile and CPU reserve
+fex service log          & rem the end of the service's log
 fex service uninstall    & rem stop and remove
 fex service debug        & rem run in the console instead (Ctrl+C ends it unsaved)
 ```
 
-State lives in `%ProgramData%\FEx\Service` (created readable by SYSTEM and
-Administrators only): one saved index and journal position per drive, the
-profile, and `service.log`. Set `FEX_RESERVE` (percent) on the service to
-override the CPU reserve.
+State lives in `%ProgramData%\FEx\Service` (readable by SYSTEM and elevated
+Administrators only): one saved index and journal position per drive, and
+the profile. The log is `%ProgramData%\FEx\service.log`, readable by
+everyone (timings and drive roots, no file names); `fex service log` shows
+its end. Set `FEX_RESERVE` (percent) on the service to override the CPU
+reserve.
 
 ## How it works
 
@@ -57,16 +61,29 @@ override the CPU reserve.
   the service.
 - Identity comes from the pipe, not the request: the service impersonates
   the client just long enough to copy its token (aborting if it can't revert).
-- Query workers take on that token and open each folder with matches for
-  listing (`FILE_LIST_DIRECTORY`): Windows' own access check, inherited ACLs
-  and all. Decisions are cached per query; hidden matches are left out of
-  the count. A token that can't be taken on makes every check fail. SYSTEM
-  clients see everything.
-- A client gets 5 s to send its request; at most 32 are served at once.
+- Each folder with matches is checked with `AccessCheck` against that
+  folder's security descriptor for `FILE_LIST_DIRECTORY`, with the client's
+  token: Windows' own evaluation (deny entries, groups, inherited ACLs).
+  This needs no file opens, because listing a folder depends only on its
+  own ACL when the token has "bypass traverse checking" (granted to
+  everyone by default). Descriptors are read once by the service and cached
+  across queries, with duplicates merged; the cache follows the change
+  journal every second (a permission change anywhere clears it; a folder
+  created, deleted or renamed drops its entry).
+- Tokens without the traverse bypass, and drives without a change journal,
+  get the exact check instead: workers take on the token and open each
+  folder for listing.
+- Hidden matches are left out of the count. Anything that can't be checked
+  is hidden. SYSTEM clients see everything.
+- Not covered: mandatory integrity labels (in the SACL); the default policy
+  only restricts writing up, not listing.
+- A newer query from the same process cancels its older ones (search as you
+  type). A client gets 5 s to send its request; at most 32 are served at once.
 
 ## To test on Windows
 
-1. Install and check `service.log`: load or crawl times per drive.
+1. Install and run `fex service log`: load or crawl times per drive, then
+   "read permissions of N folders (M distinct)".
 2. Restart the service after changing files: the log should show a journal
    catch-up with the number of folders re-read, and no crawl.
 3. As a standard user, search for names in another user's profile: they

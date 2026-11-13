@@ -405,6 +405,11 @@ impl Index {
         self.query_as(m, scope, limit, cancelled, &Everything)
     }
 
+    /// Paths of every folder with a live listing.
+    pub fn folder_paths(&self) -> Vec<Arc<str>> {
+        self.dirs.values().map(|&(s, d)| self.shards[s as usize].dirs[d as usize].clone()).collect()
+    }
+
     /// Number of global folder ids (live and dead), for per-query caches.
     pub fn dir_slots(&self) -> usize {
         self.shards.iter().map(|s| s.dirs.len()).sum()

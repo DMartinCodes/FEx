@@ -12,11 +12,14 @@
 //! * Priorities: crawler threads run in background mode with the CPU reserve
 //!   (`throttle.rs`); queries and index updates run at normal priority.
 //! * Visibility: identity comes from the pipe (the client's token, never the
-//!   request). Query workers take on that token and open each folder with
-//!   matches for listing: Windows' own access check, inherited ACLs and all.
-//!   Decisions are cached per query; hidden matches are left out of the
-//!   count. A token that can't be taken on (identification level only, say)
-//!   makes every check fail. SYSTEM clients see everything.
+//!   request). Each folder with matches is checked with `AccessCheck`
+//!   against the folder's security descriptor, read once and cached across
+//!   queries (`access.rs`), so a query opens no files; the cache follows the
+//!   change journal. Where that shortcut isn't valid (a token without the
+//!   traverse bypass, a drive without a journal), workers take on the token
+//!   and open each folder instead. Hidden matches are left out of the count.
+//!   Anything that can't be checked is hidden. SYSTEM clients see everything.
+//! * A client's newer query cancels its older ones (search as you type).
 //! * The pipe: created first-instance-only (nobody else can own the name),
 //!   remote clients refused, any authenticated user may connect. A client
 //!   gets 5 s to send its request.
@@ -43,15 +46,16 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, ImpersonateNamedPipeClient, PeekNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, ImpersonateNamedPipeClient, PeekNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken, SetThreadToken};
 
+use super::access::{self, Descriptors, Sd};
 use super::profile::{self, Profile};
 use super::proto::{self, Status};
 use super::throttle::{self, Throttle};
-use super::usn::{self, CatchUp};
+use super::usn::{self, CatchUp, Polled};
 use crate::fsys::{self, Row, SortKey};
 use crate::index::{self, Build, Everything, Freshness, Hooks, Index, Live, Matcher, Visibility};
 use crate::wire::{self, put_bytes, put_u32, put_u64, Reader};
@@ -80,16 +84,28 @@ fn now_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
 }
 
+/// Where the service logs: `%ProgramData%\FEx\service.log`, readable by
+/// users (it holds timings and drive roots, no file names), unlike the
+/// index folder beside it.
+pub fn log_path(state_dir: &Path) -> PathBuf {
+    state_dir.parent().unwrap_or(state_dir).join("service.log")
+}
+
 pub fn log(msg: &str) {
     eprintln!("fex-service: {msg}");
-    // Under the SCM there's no console: keep a log next to the indexes.
-    if let Some(dir) = LOG_DIR.get() {
-        let line = format!("{} {msg}\r\n", now_ns() / 1_000_000_000);
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("service.log")).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    // Under the SCM there's no console: keep a log file.
+    if let Some(path) = LOG_FILE.get() {
+        let secs = now_ns() / 1_000_000_000;
+        let line = format!("{secs} {msg}\r\n");
+        // Keep it bounded: one previous generation.
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > 1 << 20) {
+            let _ = std::fs::rename(path, path.with_extension("log.old"));
+        }
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     }
 }
 
-static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static LOG_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Ask the running service to stop (from the SCM's control handler).
 pub fn request_stop() {
@@ -140,6 +156,9 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 
 struct Drive {
     root: String,
+    /// The descriptor cache follows this drive's change journal, so it can
+    /// be trusted across queries.
+    tracked: AtomicBool,
     live: RwLock<Option<Arc<Live>>>,
     /// The watcher lost changes: crawl again.
     stale: Arc<AtomicBool>,
@@ -148,6 +167,10 @@ struct Drive {
 
 struct Shared {
     drives: Vec<Drive>,
+    /// Folder security descriptors, shared by all queries.
+    sds: Descriptors,
+    /// Per client process, the number of its latest query: older ones stop.
+    clients: Mutex<HashMap<u32, Arc<AtomicU64>>>,
     throttle: Arc<Throttle>,
     activity: Mutex<&'static str>,
     verified_ns: AtomicU64,
@@ -162,7 +185,12 @@ impl Shared {
 
 /// Run the service until `request_stop`. `ready` runs once the pipe is up.
 pub fn run(cfg: Config, ready: impl FnOnce()) {
-    let _ = LOG_DIR.set(cfg.state_dir.clone());
+    let log_file = log_path(&cfg.state_dir);
+    if let Some(dir) = log_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = LOG_FILE.set(log_file);
+    log(&format!("starting FEx {}", env!("CARGO_PKG_VERSION")));
     if let Err(e) = create_private_dir(&cfg.state_dir) {
         log(&format!("cannot create {}: {e}", cfg.state_dir.display()));
         return;
@@ -181,14 +209,20 @@ pub fn run(cfg: Config, ready: impl FnOnce()) {
         drives: cfg
             .roots
             .iter()
-            .map(|r| Drive { root: r.clone(), live: RwLock::new(None), stale: Arc::new(AtomicBool::new(false)), last_save: Mutex::new(Instant::now()) })
+            .map(|r| Drive { root: r.clone(), tracked: AtomicBool::new(false), live: RwLock::new(None), stale: Arc::new(AtomicBool::new(false)), last_save: Mutex::new(Instant::now()) })
             .collect(),
         throttle: Throttle::start(cfg.reserve.unwrap_or(profile.reserve), profile.cores),
+        sds: Descriptors::default(),
+        clients: Mutex::new(HashMap::new()),
         activity: Mutex::new("starting"),
         verified_ns: AtomicU64::new(0),
         dir: cfg.state_dir.clone(),
     });
     log(&format!("indexing {}", cfg.roots.join(" ")));
+    {
+        let sh = sh.clone();
+        thread::Builder::new().name("fex-permissions".into()).spawn(move || follow_permissions(&sh)).ok();
+    }
     let maint = {
         let sh = sh.clone();
         let save_every = cfg.save_every;
@@ -304,6 +338,7 @@ fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
         }
     }
     sh.verified_ns.store(now_ns(), Relaxed);
+    prefetch_descriptors(sh);
     sh.set_activity("idle");
     // The profile estimated the file count; a full crawl knows it.
     if crawled > 0 {
@@ -335,6 +370,73 @@ fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
             let dirty = live.as_ref().is_some_and(|l| index::try_read(&l.index).is_some_and(|i| i.dirty));
             if dirty && d.last_save.lock().unwrap_or_else(PoisonError::into_inner).elapsed() >= save_every {
                 save_drive(sh, d);
+            }
+        }
+    }
+}
+
+/// Read every indexed folder's security descriptor ahead of the first
+/// query, on background threads.
+fn prefetch_descriptors(sh: &Arc<Shared>) {
+    sh.set_activity("reading permissions");
+    let t = Instant::now();
+    for d in &sh.drives {
+        if !d.tracked.load(Relaxed) {
+            continue;
+        }
+        let Some(live) = d.live.read().unwrap_or_else(PoisonError::into_inner).clone() else { continue };
+        let folders = index::read(&live.index).folder_paths();
+        let next = AtomicUsize::new(0);
+        thread::scope(|sc| {
+            for _ in 0..crate::walk::cores() {
+                sc.spawn(|| {
+                    throttle::background_thread();
+                    while let Some(f) = folders.get(next.fetch_add(1, Relaxed)) {
+                        if STOP.load(Relaxed) {
+                            return;
+                        }
+                        sh.throttle.wait();
+                        let _ = sh.sds.get(f);
+                    }
+                });
+            }
+        });
+    }
+    log(&format!("read permissions of {} folders ({} distinct) in {:.1} s", sh.sds.folders(), sh.sds.distinct(), t.elapsed().as_secs_f64()));
+}
+
+/// Keep the descriptor cache true to the disk: follow each drive's change
+/// journal every second. A permission change anywhere clears the cache; a
+/// folder created, deleted or renamed drops its own entry (its path may now
+/// name a different folder).
+fn follow_permissions(sh: &Arc<Shared>) {
+    const SECURITY: u32 = 0x800;
+    const NAMES: u32 = 0x100 | 0x200 | 0x1000 | 0x2000; // create, delete, rename old/new
+    const DIRECTORY: u32 = 0x10;
+    let mut tails: Vec<Option<usn::Tail>> = sh.drives.iter().map(|d| usn::Tail::start(&d.root)).collect();
+    for (d, t) in sh.drives.iter().zip(&tails) {
+        d.tracked.store(t.is_some(), Relaxed);
+        if t.is_none() {
+            log(&format!("{}: no change journal; permissions are checked folder by folder", d.root));
+        }
+    }
+    while !STOP.load(Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+        for tail in tails.iter_mut().flatten() {
+            match tail.poll(SECURITY | NAMES) {
+                Polled::Lost => sh.sds.clear(),
+                Polled::Records(records) => {
+                    let dirs: Vec<_> = records.into_iter().filter(|(r, _)| r.attrs & DIRECTORY != 0).collect();
+                    if dirs.iter().any(|(r, _)| r.reason & SECURITY != 0) || dirs.len() > 5000 {
+                        sh.sds.clear();
+                    } else {
+                        for (r, parent) in dirs {
+                            if let Some(p) = parent {
+                                sh.sds.forget(&fsys::join(&p, &r.name));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -486,6 +588,43 @@ impl Drop for Revert {
     }
 }
 
+/// The fast check: `AccessCheck` against cached descriptors.
+struct AccessVisibility<'a> {
+    token: &'a Token,
+    sds: &'a Descriptors,
+    /// Per folder: 0 unknown, 1 visible, 2 hidden.
+    cache: Vec<AtomicU8>,
+    /// Per distinct descriptor (keyed by the object itself, which the map
+    /// keeps alive, so a cache clear mid-query can't alias two of them).
+    decided: Mutex<HashMap<usize, (Arc<Sd>, bool)>>,
+}
+
+impl Visibility for AccessVisibility<'_> {
+    fn visible(&self, dir: usize, path: &str) -> bool {
+        let Some(slot) = self.cache.get(dir) else { return false };
+        match slot.load(Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        let ok = match self.sds.get(path) {
+            None => false,
+            Some((_, sd)) => {
+                let k = Arc::as_ptr(&sd) as usize;
+                let known = self.decided.lock().unwrap_or_else(PoisonError::into_inner).get(&k).map(|e| e.1);
+                known.unwrap_or_else(|| {
+                    let ok = access::may_list(&sd, self.token.0);
+                    self.decided.lock().unwrap_or_else(PoisonError::into_inner).insert(k, (sd, ok));
+                    ok
+                })
+            }
+        };
+        slot.store(if ok { 1 } else { 2 }, Relaxed);
+        ok
+    }
+}
+
+/// The exact check: take on the token and open the folder.
 struct TokenVisibility<'a> {
     token: &'a Token,
     /// Per folder: 0 unknown, 1 visible, 2 hidden.
@@ -557,16 +696,32 @@ fn serve(sh: &Shared, pipe: &File) {
             };
             let Some(token) = client_token(pipe) else { return reply(&mut w, proto::ERROR, "could not identify the client") };
             let limit = limit.min(proto::MAX_LIMIT) as usize;
+            // A newer query from the same process makes this one obsolete.
+            let mut pid = 0u32;
+            unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) };
+            let latest = {
+                let mut clients = sh.clients.lock().unwrap_or_else(PoisonError::into_inner);
+                if clients.len() > 256 {
+                    clients.retain(|_, c| Arc::strong_count(c) > 1);
+                }
+                clients.entry(pid).or_default().clone()
+            };
+            let mine = latest.fetch_add(1, Relaxed) + 1;
+            let cancelled = || latest.load(Relaxed) != mine;
             let found = {
                 let idx = index::read(&live.index);
                 if is_system(&token) {
-                    idx.query_as(&m, &scope, limit, &|| false, &Everything)
+                    idx.query_as(&m, &scope, limit, &cancelled, &Everything)
+                } else if drive.tracked.load(Relaxed) && access::bypasses_traverse(token.0) {
+                    let vis = AccessVisibility { token: &token, sds: &sh.sds, cache: (0..idx.dir_slots()).map(|_| AtomicU8::new(0)).collect(), decided: Mutex::new(HashMap::new()) };
+                    idx.query_as(&m, &scope, limit, &cancelled, &vis)
                 } else {
                     let vis = TokenVisibility { token: &token, cache: (0..idx.dir_slots()).map(|_| AtomicU8::new(0)).collect() };
-                    idx.query_as(&m, &scope, limit, &|| false, &vis)
+                    idx.query_as(&m, &scope, limit, &cancelled, &vis)
                 }
             };
-            let (rows, total) = found.unwrap_or_default();
+            // Superseded: the client has moved on.
+            let Some((rows, total)) = found else { return };
             send_rows(&mut w, rows, total, order, first);
         }
         Ok(proto::STATUS) => {

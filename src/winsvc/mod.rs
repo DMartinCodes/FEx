@@ -11,9 +11,11 @@
 //! fex service status      what the running service is doing
 //! fex service query TEXT  search through the service
 //! fex service profile     measure this machine and show the CPU reserve
+//! fex service log         the end of the service's log
 //! fex service run         the service's own entry point (started by Windows)
 //! ```
 
+mod access;
 mod profile;
 pub mod proto;
 mod scm;
@@ -69,6 +71,19 @@ pub fn cli(args: &[String]) -> i32 {
             server::run(config(), || println!("listening on {}", proto::PIPE));
             0
         }
+        Some("log") => {
+            let path = server::log_path(&config().state_dir);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let lines: Vec<&str> = text.lines().collect();
+                    for l in &lines[lines.len().saturating_sub(60)..] {
+                        println!("{l}");
+                    }
+                    0
+                }
+                Err(e) => fail(format!("{}: {e}", path.display())),
+            }
+        }
         Some("profile") => {
             let p = profile::measure(&fixed_drives(), None);
             println!("{}", p.describe());
@@ -82,6 +97,7 @@ pub fn cli(args: &[String]) -> i32 {
                 println!("verified:  {age} s ago");
                 println!("activity:  {}{}", st.activity, if st.paused.is_empty() { String::new() } else { format!(" (paused: {})", st.paused) });
                 println!("cpu:       {}", st.reserve);
+                println!("log:       {}", server::log_path(&config().state_dir).display());
                 0
             }
             Err(e) => fail(format!("the index service isn't running: {e}")),
@@ -108,6 +124,6 @@ pub fn cli(args: &[String]) -> i32 {
                 Err(e) => fail(format!("the index service isn't running: {e}")),
             }
         }
-        _ => fail("usage: fex service install | uninstall | status | query TEXT | profile | debug | run".into()),
+        _ => fail("usage: fex service install | uninstall | status | query TEXT | log | profile | debug | run".into()),
     }
 }

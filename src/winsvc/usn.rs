@@ -71,6 +71,68 @@ pub enum CatchUp {
     Lost,
 }
 
+/// One journal record (the fields the service uses).
+pub struct Record {
+    pub parent: u64,
+    pub reason: u32,
+    pub attrs: u32,
+    pub name: String,
+}
+
+/// Read records from `from` up to `until`, those with any of `reasons`.
+/// Returns where reading stopped, or `None` if the journal can't be read
+/// from there (recreated, or wrapped past `from`).
+fn read_records(vol: &Volume, journal: u64, from: i64, until: i64, reasons: u32, mut each: impl FnMut(Record)) -> Option<i64> {
+    let mut start = from;
+    let mut buf = vec![0u64; 8 * 1024]; // 64 KB, 8-byte aligned
+    while start < until {
+        let req = READ_USN_JOURNAL_DATA_V0 { StartUsn: start, ReasonMask: reasons, ReturnOnlyOnClose: 0, Timeout: 0, BytesToWaitFor: 0, UsnJournalID: journal };
+        let mut got = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(vol.0, FSCTL_READ_USN_JOURNAL, &req as *const _ as *const _, size_of::<READ_USN_JOURNAL_DATA_V0>() as u32, buf.as_mut_ptr() as *mut _, (buf.len() * 8) as u32, &mut got, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            return None;
+        }
+        // SAFETY: `got` bytes were written by the driver.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, got as usize) };
+        if bytes.len() < 8 {
+            break;
+        }
+        let next = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+        // USN_RECORD_V2: RecordLength u32 @0, MajorVersion u16 @4,
+        // ParentFileReferenceNumber u64 @16, Reason u32 @40,
+        // FileAttributes u32 @52, FileNameLength u16 @56, FileNameOffset u16 @58.
+        let mut off = 8;
+        while off + 60 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+            if len < 60 || off + len > bytes.len() {
+                break;
+            }
+            let r = &bytes[off..off + len];
+            if u16::from_le_bytes(r[4..6].try_into().unwrap()) == 2 {
+                let (nlen, noff) = (u16::from_le_bytes(r[56..58].try_into().unwrap()) as usize, u16::from_le_bytes(r[58..60].try_into().unwrap()) as usize);
+                let name = r.get(noff..noff + nlen).map(|n| {
+                    let units: Vec<u16> = n.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                    String::from_utf16_lossy(&units)
+                });
+                each(Record {
+                    parent: u64::from_le_bytes(r[16..24].try_into().unwrap()),
+                    reason: u32::from_le_bytes(r[40..44].try_into().unwrap()),
+                    attrs: u32::from_le_bytes(r[52..56].try_into().unwrap()),
+                    name: name.unwrap_or_default(),
+                });
+            }
+            off += len;
+        }
+        if next <= start {
+            break;
+        }
+        start = next;
+    }
+    Some(start)
+}
+
 /// Everything that changed on `root`'s volume since `since`, as folders.
 pub fn changed_since(root: &str, since: Position) -> CatchUp {
     let Some(vol) = open_volume(root) else { return CatchUp::Lost };
@@ -81,45 +143,65 @@ pub fn changed_since(root: &str, since: Position) -> CatchUp {
     // Every change counts (names, sizes, dates, attributes): the index keeps
     // metadata, and re-reading a folder refreshes all of it.
     let mut parents: HashSet<u64> = HashSet::new();
-    let mut start = since.next;
-    let mut buf = vec![0u64; 8 * 1024]; // 64 KB, 8-byte aligned
-    while start < now.NextUsn {
-        let req = READ_USN_JOURNAL_DATA_V0 { StartUsn: start, ReasonMask: u32::MAX, ReturnOnlyOnClose: 0, Timeout: 0, BytesToWaitFor: 0, UsnJournalID: since.journal };
-        let mut got = 0u32;
-        let ok = unsafe {
-            DeviceIoControl(vol.0, FSCTL_READ_USN_JOURNAL, &req as *const _ as *const _, size_of::<READ_USN_JOURNAL_DATA_V0>() as u32, buf.as_mut_ptr() as *mut _, (buf.len() * 8) as u32, &mut got, std::ptr::null_mut())
-        };
-        if ok == 0 {
-            return CatchUp::Lost;
+    let mut overflow = false;
+    let read = read_records(&vol, since.journal, since.next, now.NextUsn, u32::MAX, |r| {
+        if parents.len() <= MAX_FOLDERS {
+            parents.insert(r.parent);
+        } else {
+            overflow = true;
         }
-        // SAFETY: `got` bytes were written by the driver.
-        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, got as usize) };
-        if bytes.len() < 8 {
-            break;
-        }
-        let next = i64::from_le_bytes(bytes[..8].try_into().unwrap());
-        // USN_RECORD_V2: RecordLength u32 @0, MajorVersion u16 @4,
-        // FileReferenceNumber u64 @8, ParentFileReferenceNumber u64 @16.
-        let mut off = 8;
-        while off + 24 <= bytes.len() {
-            let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-            if len < 24 || off + len > bytes.len() {
-                break;
-            }
-            if u16::from_le_bytes(bytes[off + 4..off + 6].try_into().unwrap()) == 2 {
-                parents.insert(u64::from_le_bytes(bytes[off + 16..off + 24].try_into().unwrap()));
-            }
-            off += len;
-        }
-        if parents.len() > MAX_FOLDERS {
-            return CatchUp::Lost;
-        }
-        if next <= start {
-            break;
-        }
-        start = next;
+    });
+    if read.is_none() || overflow {
+        return CatchUp::Lost;
     }
     CatchUp::Dirs(parents.into_iter().filter_map(|frn| path_of(&vol, frn)).collect())
+}
+
+/// Follows a volume's journal from now on (for cache invalidation).
+pub struct Tail {
+    vol: Volume,
+    pos: Position,
+}
+
+pub enum Polled {
+    Records(Vec<(Record, Option<String>)>),
+    /// Records were lost (the journal was recreated): assume anything changed.
+    Lost,
+}
+
+impl Tail {
+    pub fn start(root: &str) -> Option<Tail> {
+        let vol = open_volume(root)?;
+        let d = query(&vol)?;
+        Some(Tail { vol, pos: Position { journal: d.UsnJournalID, next: d.NextUsn } })
+    }
+
+    /// Records with any of `reasons` since the last poll, each with its
+    /// parent folder's current path when it still exists.
+    pub fn poll(&mut self, reasons: u32) -> Polled {
+        let Some(now) = query(&self.vol) else { return Polled::Lost };
+        if now.UsnJournalID != self.pos.journal || self.pos.next < now.FirstUsn {
+            self.pos = Position { journal: now.UsnJournalID, next: now.NextUsn };
+            return Polled::Lost;
+        }
+        let mut out = Vec::new();
+        match read_records(&self.vol, self.pos.journal, self.pos.next, now.NextUsn, reasons, |r| out.push(r)) {
+            Some(next) => self.pos.next = next.max(self.pos.next),
+            None => {
+                self.pos = Position { journal: now.UsnJournalID, next: now.NextUsn };
+                return Polled::Lost;
+            }
+        }
+        let mut parents: std::collections::HashMap<u64, Option<String>> = std::collections::HashMap::new();
+        let records = out
+            .into_iter()
+            .map(|r| {
+                let p = parents.entry(r.parent).or_insert_with(|| path_of(&self.vol, r.parent)).clone();
+                (r, p)
+            })
+            .collect();
+        Polled::Records(records)
+    }
 }
 
 /// The current path of a folder, by its file reference number. Folders
@@ -159,4 +241,44 @@ pub fn load(path: &Path) -> Option<Position> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut it = text.split_whitespace();
     Some(Position { journal: it.next()?.parse().ok()?, next: it.next()?.parse().ok()? })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs where the journal is readable (an administrator on NTFS, as on
+    /// CI runners); elsewhere it reports and passes.
+    #[test]
+    fn catches_up_and_tails_folder_changes() {
+        let base = std::env::temp_dir().join(format!("fex-usn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base_s = base.to_string_lossy().to_string();
+        let root = format!("{}\\", &base_s[..2]);
+        let Some(pos) = position(&root) else {
+            eprintln!("no readable change journal on {root}; skipped");
+            return;
+        };
+        let mut tail = Tail::start(&root).expect("journal readable");
+        std::fs::create_dir(base.join("made_after")).unwrap();
+        std::fs::write(base.join("made_after").join("x.txt"), b"1").unwrap();
+        match changed_since(&root, pos) {
+            CatchUp::Dirs(dirs) => {
+                let want = base_s.to_lowercase();
+                assert!(dirs.iter().any(|d| d.to_lowercase() == want), "{want} not among {} changed folders", dirs.len());
+            }
+            CatchUp::Lost => panic!("journal lost"),
+        }
+        let created = 0x100; // USN_REASON_FILE_CREATE
+        match tail.poll(created) {
+            Polled::Records(rs) => assert!(
+                rs.iter().any(|(r, p)| r.name == "made_after" && r.attrs & 0x10 != 0 && p.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&base_s))),
+                "folder creation not seen in {} records",
+                rs.len()
+            ),
+            Polled::Lost => panic!("tail lost"),
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
