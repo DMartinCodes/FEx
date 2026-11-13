@@ -529,7 +529,6 @@ struct UserVisibility<'a> {
     creds: &'a Creds,
     /// Per folder: 0 unknown, 1 visible, 2 hidden.
     cache: Vec<AtomicU8>,
-    checks: AtomicUsize,
 }
 
 impl Visibility for UserVisibility<'_> {
@@ -550,7 +549,6 @@ impl Visibility for UserVisibility<'_> {
             2 => return false,
             _ => {}
         }
-        self.checks.fetch_add(1, Relaxed);
         // Listing a folder needs read permission on it and search permission
         // on every ancestor: exactly what opening it for reading requires.
         let ok = sys::cstr(path).is_ok_and(|c| {
@@ -614,7 +612,7 @@ fn serve(sh: &Shared, mut s: UnixStream) {
             let hits = if creds.uid == 0 || !sh.privileged {
                 idx.query_hits(&m, &scope, &|| false, &Everything)
             } else {
-                let vis = UserVisibility { creds: &creds, cache: (0..idx.dir_slots()).map(|_| AtomicU8::new(0)).collect(), checks: AtomicUsize::new(0) };
+                let vis = UserVisibility { creds: &creds, cache: (0..idx.dir_slots()).map(|_| AtomicU8::new(0)).collect() };
                 idx.query_hits(&m, &scope, &|| false, &vis)
             };
             let mut hits = hits.unwrap_or_default();
