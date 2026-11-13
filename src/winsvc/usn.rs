@@ -254,7 +254,11 @@ mod tests {
         let base = std::env::temp_dir().join(format!("fex-usn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let base_s = base.to_string_lossy().to_string();
+        // The temp folder may be given in 8.3 form (RUNNER~1); the journal
+        // resolves full names, as the index (crawled from the root) stores.
+        let full = std::fs::canonicalize(&base).unwrap();
+        let full = full.to_string_lossy();
+        let base_s = full.strip_prefix(r"\\?\").unwrap_or(&full).to_string();
         let root = format!("{}\\", &base_s[..2]);
         let Some(pos) = position(&root) else {
             eprintln!("no readable change journal on {root}; skipped");
