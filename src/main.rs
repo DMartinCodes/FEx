@@ -30,6 +30,7 @@ mod props;
 mod recent;
 #[cfg(windows)]
 mod recyclebin;
+mod reserve;
 #[cfg(windows)]
 mod security;
 #[cfg(windows)]
@@ -43,6 +44,9 @@ mod walk;
 mod watch;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod winsvc;
+mod wire;
 
 // Linux port prototype: its own engine and UI. Shares only the portable
 // modules above that are not gated to Windows.
@@ -164,6 +168,11 @@ fn parse_args() -> Args {
 
 #[cfg(windows)]
 fn main() -> eframe::Result {
+    // `fex service ...`: the index service and its tools, no window.
+    if std::env::args().nth(1).as_deref() == Some("service") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(winsvc::cli(&args));
+    }
     install_crash_reporter();
     install_dump_writer();
     let args = parse_args();

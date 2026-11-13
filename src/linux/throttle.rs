@@ -157,20 +157,12 @@ impl Throttle {
                     let (u, now) = (t.used_ns.load(Relaxed), mono_ns());
                     let share = (u - used) as f64 / ((now - at).max(1) as f64 * t.cores as f64);
                     (used, at) = (u, now);
-                    ewma = 0.6 * ewma + 0.4 * share;
+                    ewma = crate::reserve::smooth(ewma, share);
                     t.share_ppm.store((ewma * 1e6) as u64, Relaxed);
                     let active = now.saturating_sub(t.last_pace.load(Relaxed)) < 300_000_000;
                     let step = t.step.load(Relaxed);
                     let reserve = t.reserve();
-                    let next = if !active || reserve <= 0.0 {
-                        0
-                    } else if ewma < reserve * 0.8 {
-                        (step + 1).min(NICE_STEPS.len())
-                    } else if ewma > reserve * 1.3 {
-                        step.saturating_sub(1)
-                    } else {
-                        step
-                    };
+                    let next = crate::reserve::next_step(step, ewma, reserve, active, NICE_STEPS.len());
                     t.step.store(next, Relaxed);
                     drop(t);
                     thread::sleep(Duration::from_millis(100));

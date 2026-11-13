@@ -26,8 +26,7 @@ use std::time::Duration;
 use super::index::{self, Crawl};
 use super::{fsys, sys, walk};
 
-pub const MIN_RESERVE: f64 = 0.005;
-pub const MAX_RESERVE: f64 = 0.05;
+pub use crate::reserve::reserve_for;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
@@ -43,14 +42,6 @@ pub struct Profile {
     pub entry_cost_ns: u64,
     /// Share of total CPU capacity reserved under full load (0.005 = 0.5%).
     pub reserve: f64,
-}
-
-/// The reserve for a machine with `cores` cores and `files` files.
-pub fn reserve_for(cores: usize, files: u64, battery: bool) -> f64 {
-    let per_core = files as f64 / cores.max(1) as f64;
-    let t = ((per_core.max(1.0).log10() - 4.0) / 2.0).clamp(0.0, 1.0);
-    let r = MIN_RESERVE + t * (MAX_RESERVE - MIN_RESERVE);
-    if battery { (r * 1.25).min(MAX_RESERVE) } else { r }
 }
 
 impl Profile {
@@ -209,19 +200,6 @@ pub fn measure(root: &[u8], skip: &HashSet<Vec<u8>>, known_files: Option<u64>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reserve_scales_with_files_per_core() {
-        // A 64-core compute server with half a million files: the floor.
-        assert_eq!(reserve_for(64, 500_000, false), MIN_RESERVE);
-        // An 8-core laptop with 2M files: near the ceiling.
-        let laptop = reserve_for(8, 2_000_000, true);
-        assert!(laptop > 0.04 && laptop <= MAX_RESERVE, "{laptop}");
-        // 1M files per core and beyond: the ceiling.
-        assert_eq!(reserve_for(2, 5_000_000, false), MAX_RESERVE);
-        // Monotonic in files.
-        assert!(reserve_for(16, 4_000_000, false) > reserve_for(16, 400_000, false));
-    }
 
     #[test]
     fn round_trips() {

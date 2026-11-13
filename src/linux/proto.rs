@@ -18,7 +18,7 @@
 //! Rows carry no sizes or dates: the client stats what it shows, as the
 //! user, which is also the final permission check.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,73 +46,14 @@ pub fn socket_path() -> PathBuf {
 
 // ------------------------------------------------------------ encoding
 
-pub fn put_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
+pub use crate::wire::{put_bytes, put_u32, put_u64, Reader};
 
-pub fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
-pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    put_u32(out, b.len() as u32);
-    out.extend_from_slice(b);
-}
-
-/// Reads fields from a received message; every read is bounds-checked.
-pub struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
-        Reader { buf, pos: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.buf.len()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated message"))?;
-        let s = &self.buf[self.pos..end];
-        self.pos = end;
-        Ok(s)
-    }
-
-    pub fn u8(&mut self) -> io::Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    pub fn u32(&mut self) -> io::Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    pub fn u64(&mut self) -> io::Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    pub fn bytes(&mut self) -> io::Result<&'a [u8]> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-}
-
-/// A whole message: u32 length, then the body.
 pub fn send(stream: &mut UnixStream, body: &[u8]) -> io::Result<()> {
-    let mut msg = Vec::with_capacity(body.len() + 4);
-    put_u32(&mut msg, body.len() as u32);
-    msg.extend_from_slice(body);
-    stream.write_all(&msg)
+    crate::wire::send(stream, body)
 }
 
 pub fn recv(stream: &mut UnixStream, max: usize) -> io::Result<Vec<u8>> {
-    let mut len = [0u8; 4];
-    stream.read_exact(&mut len)?;
-    let len = u32::from_le_bytes(len) as usize;
-    if len > max {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
-    }
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body)?;
-    Ok(body)
+    crate::wire::recv(stream, max)
 }
 
 // ------------------------------------------------------------ client

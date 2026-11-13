@@ -14,6 +14,7 @@ ranking), both platform-neutral.
 ```bash
 cargo build --release
 ./target/release/fex [folder]            # the file explorer (X11)
+sudo ./target/release/fex profile --save # measure the machine (install step)
 sudo ./target/release/fex daemon         # the index daemon (see below)
 ./target/release/fex query <text>        # search through the daemon
 ./target/release/fex status              # daemon state
@@ -102,6 +103,32 @@ ACL granting the user, and a world-readable folder inside a private one.
 **Protocol.** Unix socket `/run/fex/indexd.sock`; see `proto.rs`. Results
 carry names and types; clients stat what they show, as the user.
 
+**Streaming.** Queries collect matches as compact (shard, entry) pairs. The
+daemon picks the first screenful in the client's sort order by comparing
+names in place in the index (a linear-time selection, no copying), sends it
+with the exact match count, then builds and streams the rest after
+releasing the index lock. Past the 250,000-row limit, the rows kept are the
+first by name.
+
+**Metadata backfill.** The GUI shows result names at once; a worker stats
+the rows on the thread pool, rows on screen first, and sizes and dates
+appear as they arrive. Sorting by size or date takes effect once every row
+has them.
+
+**CPU reserve under load.** `SCHED_IDLE` gets nothing on a machine that is
+always fully loaded, so the daemon reserves a small share of total CPU for
+background work (it still takes everything idle). `fex profile` (run at
+install, or by the daemon on first start) measures cores, memory, battery,
+disk type, files in use (inode counts, no crawl) and the CPU cost per
+entry, and picks the reserve from files per core: 0.5% up to 10K per core,
+5% from 1M per core, log-scaled between, a quarter more with a battery
+(capped at 5%). The first crawl replaces the file estimate with the real
+count. A controller measures background threads' own CPU time and steps
+them from `SCHED_IDLE` through nice 19, 15, 10, 5, 0 until they get the
+reserve, and back once they have it. Override with `--reserve PCT` or by
+editing `/var/lib/fex/profile`. The policy is shared with Windows
+(`src/reserve.rs`).
+
 ## Design decisions (from the discovery review)
 
 - **Names are bytes.** Linux filenames are any bytes except `/` and NUL, so
@@ -140,8 +167,11 @@ Daemon, whole machine (1.8M entries, 92K folders):
   after 826 ms (a cold crawl of `/` takes several seconds)
 - changes searchable via fanotify within 8–16 ms (create, rename, new
   subtree, deleted subtree)
-- query round trip as root / as a filtered user: 2.9 / 3.5 ms (`conf`, 3K
-  matches); 132 / 144 ms (`p`, 650K matches, 250K rows sent)
+- first screen of results as root / as a filtered user: 1.7 / 2.8 ms
+  (`conf`, 3K matches); 52 / 83 ms (`p`, 650K matches); the remaining rows
+  of a 250K-row result stream in behind it (~170 ms in total)
+- GUI on a cold cache: first rows 60 ms after typing, with their dates
+  already filled (visible rows are backfilled first)
 
 Background crawling beside a CPU-bound job on every core:
 
@@ -152,20 +182,22 @@ Background crawling beside a CPU-bound job on every core:
 | job + crawler at idle priority (daemon) | 100.2% | ~0 |
 | idle-priority crawler alone | — | 11.3 M entries/s |
 
+With the reserve (same job, 10 s phases):
+
+| Crawler | Crawler's share of CPU | Job throughput |
+|---|---|---|
+| idle priority, no reserve | 0.31% | 98.9% |
+| idle priority, 0.5% reserve | 0.56% | 97.9% |
+| idle priority, 5% reserve | 5.45% | 94.1% |
+
 Earlier engine numbers: recording metadata during the crawl costs
 2.4–2.6x; filling it in for results costs milliseconds.
 
 ## Known limits and open decisions
 
-- **Cold metadata for results.** A snapshot holds names, not the kernel's
-  inode cache: after a cold boot, sizes and dates for ~1,000 results took
-  55 ms. The UI should show names at once and fill metadata progressively.
-- **Busy machines never index.** `SCHED_IDLE` gets almost no CPU on a box
-  that is always fully loaded, so a first crawl there may not finish. A
-  floor (nice 19 instead of `SCHED_IDLE`, about 1.5% of a core under load)
-  would guarantee progress.
-- **Large result sets** spend their time sending 250K rows over the socket;
-  sending the first screenful plus the count, then pages, would fix that.
+- **Cold metadata for results** still costs inode reads (a snapshot holds
+  names, not the kernel's inode cache); backfill keeps that off the first
+  screen, but sorting a big cold result by size waits for it.
 - Not tested under systemd here (the test container has no systemd); the
   unit file is untested, and PSI self-throttling is only accurate inside a
   cgroup of its own, as the service runs.
@@ -174,11 +206,9 @@ Earlier engine numbers: recording metadata during the crawl costs
 
 ## Next steps
 
-1. Decide on the busy-machine floor and progressive result metadata.
-2. File operations: `renameat2` (`RENAME_NOREPLACE`), `copy_file_range`
+1. File operations: `renameat2` (`RENAME_NOREPLACE`), `copy_file_range`
    (reflinks on Btrfs/XFS, server-side copy on NFS 4.2/SMB3) in the existing
    parallel, largest-first transfer design; freedesktop Trash.
-3. Clipboard and drag and drop: `text/uri-list` and
+2. Clipboard and drag and drop: `text/uri-list` and
    `x-special/gnome-copied-files`; XDND for dragging files out.
-4. Windows service: the same index core and protocol (named pipe), the NTFS
-   change journal instead of fanotify, background mode for priorities.
+3. Windows: see WINDOWS.md for the index service.

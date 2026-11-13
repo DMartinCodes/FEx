@@ -284,6 +284,35 @@ pub struct Index {
     pub dirty: bool,
 }
 
+/// Which folders' entries a query may report. The index service implements
+/// this per client, so users only see names in folders they could list.
+pub trait Visibility: Sync {
+    /// Runs on each worker thread before it checks anything (to take on the
+    /// client's identity); dropping the result undoes it.
+    fn enter(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+    /// Whether entries of folder `dir` (a global id below `dir_slots`, at
+    /// `path`) may be reported.
+    fn visible(&self, dir: usize, path: &str) -> bool;
+    /// False when everything is visible, so queries skip the checks.
+    fn filters(&self) -> bool {
+        true
+    }
+}
+
+/// No filtering (the app's own indexes).
+pub struct Everything;
+
+impl Visibility for Everything {
+    fn visible(&self, _: usize, _: &str) -> bool {
+        true
+    }
+    fn filters(&self) -> bool {
+        false
+    }
+}
+
 /// Entries per query work unit: big enough to amortize dispatch, small
 /// enough to balance across cores.
 const CHUNK: usize = 32 * 1024;
@@ -373,7 +402,32 @@ impl Index {
         limit: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Option<(Vec<Row>, usize)> {
+        self.query_as(m, scope, limit, cancelled, &Everything)
+    }
+
+    /// Number of global folder ids (live and dead), for per-query caches.
+    pub fn dir_slots(&self) -> usize {
+        self.shards.iter().map(|s| s.dirs.len()).sum()
+    }
+
+    /// `query` reporting (and counting) only entries of folders `vis`
+    /// allows (the index service filters per client this way).
+    pub fn query_as(
+        &self,
+        m: &Matcher,
+        scope: &str,
+        limit: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        vis: &dyn Visibility,
+    ) -> Option<(Vec<Row>, usize)> {
         let units = self.query_units(scope);
+        let mut base = Vec::with_capacity(self.shards.len());
+        let mut acc = 0;
+        for s in &self.shards {
+            base.push(acc);
+            acc += s.dirs.len();
+        }
+        let filters = vis.filters();
         let total = AtomicUsize::new(0);
         let retained = AtomicUsize::new(0);
         let aborted = AtomicBool::new(false);
@@ -384,11 +438,27 @@ impl Index {
                 aborted.store(true, Relaxed);
                 return;
             }
+            let _guard = if filters { vis.enter() } else { None };
             let (si, a, b) = units[u];
             let shard = &self.shards[si];
             let mut out = Vec::new();
             let mut count = 0;
+            let mut last: Option<(u32, bool)> = None;
             shard.scan(m, a, b, |i| {
+                if filters {
+                    let d = shard.meta[i].dir;
+                    let ok = match last {
+                        Some((ld, ok)) if ld == d => ok,
+                        _ => {
+                            let ok = vis.visible(base[si] + d as usize, &shard.dirs[d as usize]);
+                            last = Some((d, ok));
+                            ok
+                        }
+                    };
+                    if !ok {
+                        return;
+                    }
+                }
                 count += 1;
                 if retained.load(Relaxed) < limit {
                     let slot = retained.fetch_add(1, Relaxed);
@@ -558,8 +628,22 @@ impl Index {
         }
         let _one = SAVING.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = store_dir().ok_or_else(|| io::Error::other("LOCALAPPDATA is not set"))?;
-        fs::create_dir_all(&dir)?;
-        let path = file_for(&dir, &self.root);
+        let path = self.save_to(&dir)?;
+        prune(&dir, &path, &self.root);
+        Ok(())
+    }
+
+    /// Where an index of `root` is saved in `dir`.
+    pub fn saved_path(dir: &Path, root: &str) -> PathBuf {
+        file_for(dir, root)
+    }
+
+    /// Write the live listings to `dir` (temp file, then rename), without
+    /// the per-user checks of `save`: for the index service, whose folder
+    /// only SYSTEM and administrators can read. Returns the file written.
+    pub fn save_to(&self, dir: &Path) -> io::Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        let path = file_for(dir, &self.root);
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         {
             let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
@@ -584,8 +668,7 @@ impl Index {
             w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         }
         fs::rename(&tmp, &path)?;
-        prune(&dir, &path, &self.root);
-        Ok(())
+        Ok(path)
     }
 
     /// Read a saved index. Anything malformed yields `None`, never a panic.
@@ -801,6 +884,31 @@ fn flush(root: &str, st: &mut Pending) {
     }
 }
 
+/// Re-read `dirs` (or their nearest indexed ancestors) and crawl what's new
+/// below them: for changes learned elsewhere (the NTFS change journal).
+/// Returns how many folders were re-read.
+pub fn refresh_dirs(index: &Shared, dirs: Vec<String>) -> usize {
+    let mut seen: HashSet<Box<str>> = HashSet::new();
+    let mut pending: Vec<Arc<str>> = Vec::new();
+    {
+        let idx = read(index);
+        for d in dirs {
+            if let Some(dir) = idx.known_ancestor(&d)
+                && seen.insert(key(&dir))
+            {
+                pending.push(dir.into());
+            }
+        }
+    }
+    let mut n = 0;
+    while !pending.is_empty() {
+        n += pending.len();
+        let scans: Vec<DirScan> = pending.drain(..).map(read_dir).collect();
+        pending = write(index).apply(scans);
+    }
+    n
+}
+
 /// Apply watcher changes: metadata updates in place, everything else by
 /// re-reading the folder (and crawling new subfolders). True when names changed.
 fn refresh(root: &str, index: &Shared, changes: Vec<(u32, String)>) -> bool {
@@ -883,6 +991,15 @@ pub struct Build {
     pub dirs_done: AtomicUsize,
     pub entries: AtomicUsize,
     pub started: Instant,
+    hooks: Option<Hooks>,
+}
+
+/// Crawl hooks for background builds (the index service): `init` runs once
+/// on each crawler thread (to lower its priority), `pace` before each folder
+/// (to account CPU time and pause while the machine is busy).
+pub struct Hooks {
+    pub init: Box<dyn Fn() + Send + Sync>,
+    pub pace: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Build {
@@ -895,7 +1012,15 @@ impl Build {
             dirs_done: AtomicUsize::new(0),
             entries: AtomicUsize::new(0),
             started: Instant::now(),
+            hooks: None,
         })
+    }
+
+    /// A build whose crawler threads run `hooks` (see `Hooks`).
+    pub fn with_hooks(root: &str, hooks: Hooks) -> Arc<Build> {
+        let mut b = Arc::try_unwrap(Build::new(root)).unwrap_or_else(|_| unreachable!());
+        b.hooks = Some(hooks);
+        Arc::new(b)
     }
 
     pub fn set_matcher(&self, generation: u64, m: Option<Arc<Matcher>>) {
@@ -944,6 +1069,9 @@ impl Build {
 
     fn worker(&self, queue: &Queue, on_hits: &(dyn Fn(u64, Vec<Row>) + Sync)) -> (Shard, usize) {
         let _enlisted = queue.enlist();
+        if let Some(h) = &self.hooks {
+            (h.init)();
+        }
         let mut shard = Shard::default();
         let mut local: Vec<Arc<str>> = Vec::new();
         let mut name = String::new();
@@ -967,6 +1095,9 @@ impl Build {
             };
             if self.cancel.load(Relaxed) {
                 break;
+            }
+            if let Some(h) = &self.hooks {
+                (h.pace)();
             }
             let (generation, matcher) = self.matcher.read().unwrap_or_else(PoisonError::into_inner).clone();
             if generation != hits_gen {
