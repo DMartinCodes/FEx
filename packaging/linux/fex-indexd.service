@@ -1,0 +1,60 @@
+# FEx index daemon: keeps a name index of the machine ready for FEx.
+#
+# Install:  sudo install -m755 target/release/fex /usr/local/bin/fex
+#           sudo install -m644 packaging/linux/fex-indexd.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now fex-indexd
+# Check:    fex status        Logs: journalctl -u fex-indexd
+
+[Unit]
+Description=FEx file index daemon
+Documentation=file:///usr/local/share/doc/fex/LINUX.md
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/fex daemon --root / --state-dir /var/lib/fex --socket /run/fex/indexd.sock
+Restart=on-failure
+
+# /var/lib/fex (snapshot, 0700) and /run/fex (socket) are created by systemd.
+StateDirectory=fex
+StateDirectoryMode=0700
+RuntimeDirectory=fex
+RuntimeDirectoryMode=0755
+
+# Priorities. Crawls and sweeps already run on SCHED_IDLE / idle-I/O
+# threads inside the daemon; queries stay at normal priority, so the
+# service itself is not niced (that would slow answers, not crawls).
+# Its own cgroup lets it tell its I/O stalls from everyone else's (PSI).
+CPUWeight=20
+IOWeight=10
+MemoryHigh=1G
+
+# Privileges: read every folder (CAP_DAC_READ_SEARCH, also needed to turn
+# fanotify handles into paths), mark filesystems (CAP_SYS_ADMIN, fanotify
+# only), and take on each client's filesystem identity per query
+# (CAP_SETUID/CAP_SETGID for setfsuid/setfsgid/setgroups).
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SETUID CAP_SETGID
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Hardening: the daemon reads the filesystem and writes only its state.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/fex
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

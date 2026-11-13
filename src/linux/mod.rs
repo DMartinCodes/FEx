@@ -7,9 +7,14 @@
 //! `fex --bench <folder> [query ...]` measures the engine without a window.
 
 mod app;
+mod daemon;
+mod fanotify;
 mod fsys;
 mod index;
+mod proto;
+mod snapshot;
 mod sys;
+mod throttle;
 mod walk;
 mod watch;
 
@@ -20,8 +25,19 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 const USAGE: &str = "usage: fex [folder]
+       fex daemon [--root /] [--state-dir /var/lib/fex] [--socket PATH] [--workers N]
+                  [--sweep-every SECS] [--save-every SECS] [--io-limit PCT]
+                  [--no-fanotify] [--include-network]
+       fex query [--regex] [--scope DIR] [--limit N] [--show N] <text>
+       fex status
        fex --bench <folder> [--runs N] [query ...]
-           query: keywords (globs with * ?, type:ext), or re:<regex>";
+           query: keywords (globs with * ?, type:ext), or re:<regex>
+       fex --bench-interference <folder> [--secs N]
+           (a CPU-bound job on every core, alone and beside crawlers at normal
+           and idle priority)
+       fex --bench-snapshot <folder> [--snapshot FILE] [--runs N]
+           (as root, also measures cold-cache times by dropping the page cache)
+       A folder named like a subcommand opens as ./daemon etc.";
 
 /// Panics go to `$XDG_STATE_HOME/fex/crash.log` (default ~/.local/state).
 fn install_crash_reporter() {
@@ -61,6 +77,11 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("--bench") => bench(&args[1..]),
+        Some("--bench-snapshot") => bench_snapshot(&args[1..]),
+        Some("--bench-interference") => bench_interference(&args[1..]),
+        Some("daemon") => cli_daemon(&args[1..]),
+        Some("query") => cli_query(&args[1..]),
+        Some("status") => cli_status(),
         _ => gui(args.into_iter().next()),
     }
 }
@@ -236,5 +257,327 @@ fn bench(args: &[String]) -> ExitCode {
         }
         println!("\nlargest folder: {} ({n} entries) listed with metadata in {}", String::from_utf8_lossy(&dir), ms(median(times)));
     }
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------------ daemon CLI
+
+fn arg_value<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<&'a String, String> {
+    it.next().ok_or_else(|| format!("{flag} needs a value"))
+}
+
+fn cli_daemon(args: &[String]) -> ExitCode {
+    let mut cfg = daemon::Config {
+        root: b"/".to_vec(),
+        state_dir: std::path::PathBuf::from("/var/lib/fex"),
+        socket: proto::socket_path(),
+        sweep_every: Duration::from_secs(1800),
+        save_every: Duration::from_secs(600),
+        fanotify: true,
+        include_network: false,
+        workers: walk::cores(),
+        io_limit: 10.0,
+    };
+    let mut it = args.iter();
+    let parsed: Result<(), String> = (|| {
+        while let Some(a) = it.next() {
+            let secs = |v: &String| v.parse::<u64>().map(Duration::from_secs).map_err(|_| format!("{a}: expected seconds"));
+            match a.as_str() {
+                "--root" => cfg.root = fsys::resolve_input(arg_value(&mut it, a)?, b"/"),
+                "--state-dir" => cfg.state_dir = arg_value(&mut it, a)?.into(),
+                "--socket" => cfg.socket = arg_value(&mut it, a)?.into(),
+                "--sweep-every" => cfg.sweep_every = secs(arg_value(&mut it, a)?)?,
+                "--save-every" => cfg.save_every = secs(arg_value(&mut it, a)?)?,
+                "--workers" => cfg.workers = arg_value(&mut it, a)?.parse().map_err(|_| "--workers: expected a number")?,
+                "--io-limit" => cfg.io_limit = arg_value(&mut it, a)?.parse().map_err(|_| "--io-limit: expected a percentage")?,
+                "--no-fanotify" => cfg.fanotify = false,
+                "--include-network" => cfg.include_network = true,
+                other => return Err(format!("unknown option {other}")),
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = parsed {
+        eprintln!("{e}\n{USAGE}");
+        return ExitCode::FAILURE;
+    }
+    daemon::run(cfg)
+}
+
+fn cli_query(args: &[String]) -> ExitCode {
+    let (mut regex, mut limit, mut show) = (false, proto::MAX_LIMIT, 20usize);
+    let mut scope = None;
+    let mut words = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--regex" => regex = true,
+            "--scope" => scope = it.next().cloned(),
+            "--limit" => limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(limit),
+            "--show" => show = it.next().and_then(|v| v.parse().ok()).unwrap_or(show),
+            w => words.push(w.to_string()),
+        }
+    }
+    let cwd = std::env::current_dir().map(|d| d.as_os_str().as_bytes().to_vec()).unwrap_or_else(|_| b"/".to_vec());
+    let scope = scope.map_or(b"/".to_vec(), |s| fsys::resolve_input(&s, &cwd));
+    let t = Instant::now();
+    match proto::query(&scope, &words.join(" "), regex, limit) {
+        Err(e) => {
+            eprintln!("no index daemon at {}: {e}", proto::socket_path().display());
+            ExitCode::FAILURE
+        }
+        Ok(proto::Reply::Rows { mut rows, total }) => {
+            let asked = t.elapsed();
+            let t = Instant::now();
+            fsys::fill_meta(&mut rows);
+            let meta = t.elapsed();
+            println!("{total} matches ({} rows) in {} round trip + {} metadata", rows.len(), ms(asked), ms(meta));
+            for r in rows.iter().take(show) {
+                println!("{}", String::from_utf8_lossy(&r.full_path(b"")));
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(proto::Reply::NotCovered(root)) => {
+            eprintln!("the daemon indexes {}, which doesn't cover that scope", String::from_utf8_lossy(&root));
+            ExitCode::FAILURE
+        }
+        Ok(proto::Reply::Busy(m) | proto::Reply::Error(m)) => {
+            eprintln!("{m}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cli_status() -> ExitCode {
+    match proto::status() {
+        Err(e) => {
+            eprintln!("no index daemon at {}: {e}", proto::socket_path().display());
+            ExitCode::FAILURE
+        }
+        Ok(st) => {
+            let age = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|n| n.as_secs().saturating_sub(st.verified_ns / 1_000_000_000))
+                .unwrap_or(0);
+            println!("root:      {}", String::from_utf8_lossy(&st.root));
+            println!("index:     {}", if st.ready { format!("{} entries, {} folders (generation {})", st.entries, st.dirs, st.generation) } else { "being built".into() });
+            println!("memory:    {:.1} MB mapped snapshot + {:.1} MB heap", st.mapped_bytes as f64 / 1048576.0, st.heap_bytes as f64 / 1048576.0);
+            println!("verified:  {age} s ago");
+            println!("watching:  {}", if st.watched > 0 { format!("{} filesystem(s) with fanotify", st.watched) } else { "periodic sweeps only".into() });
+            println!("activity:  {}{}", st.activity, if st.paused.is_empty() { String::new() } else { format!(" (paused: {})", st.paused) });
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+// ------------------------------------------------------------ snapshot benchmark
+
+/// Drop the kernel's page, dentry and inode caches (root only).
+fn drop_caches() -> bool {
+    unsafe { libc::sync() };
+    std::fs::write("/proc/sys/vm/drop_caches", "3").is_ok()
+}
+
+fn rss_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmRSS:").map(|v| v.trim().trim_end_matches("kB").trim().parse::<f64>().ok())).flatten())
+        .map_or(0.0, |kb| kb / 1024.0)
+}
+
+/// The questions behind the daemon: how long until the first search
+/// result, from a crawl versus from a snapshot, warm and cold; and what
+/// verifying a snapshot (the ctime sweep) costs.
+fn bench_snapshot(args: &[String]) -> ExitCode {
+    let mut runs = 3usize;
+    let mut root = None;
+    let mut snap = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--runs" => runs = it.next().and_then(|n| n.parse().ok()).filter(|&n| n > 0).unwrap_or(runs),
+            "--snapshot" => snap = it.next().map(std::path::PathBuf::from),
+            _ => root = Some(a.clone()),
+        }
+    }
+    let Some(root) = root else {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let cwd = std::env::current_dir().map(|d| d.as_os_str().as_bytes().to_vec()).unwrap_or_else(|_| b"/".to_vec());
+    let root = fsys::resolve_input(&root, &cwd);
+    let snap = snap.unwrap_or_else(|| std::env::temp_dir().join(format!("fex-bench-{}.snap", std::process::id())));
+    let m = index::Matcher::new("conf", false).unwrap().unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let cores = walk::cores();
+    let first_result = |idx: &index::Index| {
+        let t = Instant::now();
+        let (mut rows, total) = idx.query(&m, &root, 250_000, &|| false).unwrap();
+        let q = t.elapsed();
+        let t = Instant::now();
+        fsys::fill_meta(&mut rows);
+        (q, t.elapsed(), total)
+    };
+    println!("FEx snapshot benchmark: {} · {cores} threads · median of {runs}", String::from_utf8_lossy(&root));
+
+    let rss0 = rss_mb();
+    let t = Instant::now();
+    let built = index::Build::new(&root, false).run().unwrap();
+    let crawl_warmup = t.elapsed();
+    let rss_built = rss_mb();
+    let t = Instant::now();
+    if let Err(e) = built.save(&snap) {
+        eprintln!("{}: {e}", snap.display());
+        return ExitCode::FAILURE;
+    }
+    let save = t.elapsed();
+    let size = std::fs::metadata(&snap).map_or(0, |m| m.len());
+    println!(
+        "index: {} entries, {} folders · heap {:.1} MB (RSS +{:.1} MB) · snapshot {:.1} MB written in {}",
+        built.entries,
+        built.dirs,
+        built.bytes() as f64 / 1048576.0,
+        rss_built - rss0,
+        size as f64 / 1048576.0,
+        ms(save)
+    );
+    drop(built);
+    let _ = crawl_warmup;
+
+    let can_drop = drop_caches();
+    let modes: &[bool] = if can_drop { &[false, true] } else { &[false] };
+    println!("\n{:<8} {:<34} {:>12} {:>10} {:>12}", "cache", "path to first result", "ready", "query", "+ metadata");
+    for &cold in modes {
+        let label = if cold { "cold" } else { "warm" };
+        let (mut crawl_t, mut load_t, mut q1, mut q2, mut f1, mut f2) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+        for _ in 0..runs {
+            if cold {
+                drop_caches();
+            }
+            let t = Instant::now();
+            let idx = index::Build::new(&root, false).run().unwrap();
+            crawl_t.push(t.elapsed());
+            let (q, f, _) = first_result(&idx);
+            q1.push(q);
+            f1.push(f);
+            drop(idx);
+            if cold {
+                drop_caches();
+            }
+            let t = Instant::now();
+            let idx = index::Index::load(&snap).unwrap();
+            load_t.push(t.elapsed());
+            let (q, f, _) = first_result(&idx);
+            q2.push(q);
+            f2.push(f);
+        }
+        println!("{label:<8} {:<34} {:>12} {:>10} {:>12}", "crawl, then search", ms(median(crawl_t)), ms(median(q1)), ms(median(f1)));
+        println!("{label:<8} {:<34} {:>12} {:>10} {:>12}", "map snapshot, then search", ms(median(load_t)), ms(median(q2)), ms(median(f2)));
+    }
+    let rss_before = rss_mb();
+    let idx = index::Index::load(&snap).unwrap();
+    println!("\nmapped snapshot: RSS +{:.1} MB, heap {:.1} MB, page cache {:.1} MB", rss_mb() - rss_before, idx.bytes() as f64 / 1048576.0, idx.mapped_bytes() as f64 / 1048576.0);
+
+    println!("\n{:<8} {:<34} {:>12}", "cache", "verify snapshot (ctime sweep)", "time");
+    for &cold in modes {
+        for workers in [1, cores] {
+            let mut times = vec![];
+            let mut changed = 0;
+            for _ in 0..runs {
+                if cold {
+                    drop_caches();
+                }
+                let t = Instant::now();
+                changed = idx.sweep(workers, &cancel, &|| {}, &|| {}).len();
+                times.push(t.elapsed());
+            }
+            println!(
+                "{:<8} {:<34} {:>12}",
+                if cold { "cold" } else { "warm" },
+                format!("{} folders, {workers} thread(s), {changed} changed", idx.dirs),
+                ms(median(times))
+            );
+        }
+    }
+    if !can_drop {
+        println!("\n(not root: cold-cache rows skipped)");
+    }
+    let _ = std::fs::remove_file(&snap);
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------------ interference benchmark
+
+/// Does background indexing slow real work down? A CPU-bound job runs on
+/// every core (normal priority) for a fixed time, alone and with a crawler
+/// looping beside it at normal priority and at the daemon's idle priority.
+/// The last phase runs the idle crawler alone: an idle machine should give
+/// it everything.
+fn bench_interference(args: &[String]) -> ExitCode {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+    let mut secs = 8u64;
+    let mut root = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--secs" => secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(secs),
+            _ => root = Some(a.clone()),
+        }
+    }
+    let Some(root) = root else {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let cwd = std::env::current_dir().map(|d| d.as_os_str().as_bytes().to_vec()).unwrap_or_else(|_| b"/".to_vec());
+    let root = fsys::resolve_input(&root, &cwd);
+    let cores = walk::cores();
+    let skip = sys::crawl_skips();
+    let _ = index::Build::new(&root, false).run(); // warm the caches: this measures CPU contention
+
+    // (job iterations per second, crawler entries per second)
+    let (skip, root) = (&skip, &root);
+    let phase = |job: bool, crawler: Option<bool>| -> (f64, f64) {
+        let (stop, work, entries) = (&AtomicBool::new(false), &AtomicU64::new(0), &AtomicUsize::new(0));
+        std::thread::scope(|sc| {
+            if job {
+                for _ in 0..cores {
+                    sc.spawn(move || {
+                        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+                        while !stop.load(Relaxed) {
+                            for _ in 0..100_000 {
+                                x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
+                            }
+                            work.fetch_add(1, Relaxed);
+                        }
+                    });
+                }
+            }
+            if let Some(idle) = crawler {
+                sc.spawn(move || {
+                    let init: &(dyn Fn() + Sync) = if idle { &throttle::background_thread } else { &|| {} };
+                    while !stop.load(Relaxed) {
+                        let seen = AtomicUsize::new(0);
+                        let c = index::Crawl { workers: cores, cancel: stop, skip, with_meta: false, seen: &seen, init, pace: &|| {} };
+                        if let Some(idx) = index::build(root, &c) {
+                            entries.fetch_add(idx.entries, Relaxed);
+                        }
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_secs(secs));
+            stop.store(true, Relaxed);
+        });
+        (work.load(Relaxed) as f64 / secs as f64, entries.load(Relaxed) as f64 / secs as f64)
+    };
+    println!("FEx interference benchmark: crawling {} on {cores} threads, {secs} s per phase, warm cache\n", String::from_utf8_lossy(root));
+    let (base, _) = phase(true, None);
+    println!("{:<44} {:>14} {:>16}", "phase", "job (rel.)", "crawl M ent./s");
+    println!("{:<44} {:>14} {:>16}", "job alone", "100.0%", "-");
+    for (label, idle) in [("job + crawler at normal priority", false), ("job + crawler at idle priority (daemon)", true)] {
+        let (job, crawl) = phase(true, Some(idle));
+        println!("{label:<44} {:>13.1}% {:>16.2}", job / base * 100.0, crawl / 1e6);
+    }
+    let (_, crawl) = phase(false, Some(true));
+    println!("{:<44} {:>14} {:>16.2}", "idle-priority crawler alone", "-", crawl / 1e6);
     ExitCode::SUCCESS
 }

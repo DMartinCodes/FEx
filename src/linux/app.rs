@@ -17,6 +17,7 @@ use eframe::egui::{self, Align2, Button, Color32, FontId, Key, Modifiers, Rect, 
 
 use super::fsys::{self, Row, SortKey};
 use super::index::{Build, Index, Matcher};
+use super::proto;
 use super::sys;
 use super::watch::{self, Change, Watcher};
 use crate::typeahead;
@@ -35,6 +36,10 @@ enum Msg {
     Built(Option<Index>),
     Results { generation: u64, rows: Vec<Row>, total: usize, query: Duration, meta: Duration },
     Fonts(Option<String>),
+    /// Latest status of the index daemon (`None`: not running).
+    Daemon(Option<proto::Status>),
+    /// The daemon couldn't answer this query; search in-process instead.
+    DaemonFailed { generation: u64 },
 }
 
 struct Results {
@@ -106,6 +111,10 @@ pub struct App {
     places: Vec<(String, Vec<u8>)>,
     volumes: Vec<(String, Vec<u8>)>,
     font: Option<String>,
+    /// The system index daemon, when one is running.
+    daemon: Option<proto::Status>,
+    /// It failed a query; use the in-process index until its next status.
+    daemon_failed: bool,
 }
 
 impl App {
@@ -163,8 +172,11 @@ impl App {
             places: sys::quick_access(),
             volumes,
             font: None,
+            daemon: None,
+            daemon_failed: false,
         };
         app.load_system_font();
+        app.watch_daemon();
         app.navigate(cwd, false);
         app
     }
@@ -187,6 +199,25 @@ impl App {
             let _ = tx.send(Msg::Fonts(name));
             ctx.request_repaint();
         });
+    }
+
+    /// Poll the index daemon's status every few seconds (cheap: one small
+    /// message over a local socket).
+    fn watch_daemon(&self) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            loop {
+                if tx.send(Msg::Daemon(proto::status().ok())).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+                thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
+
+    fn daemon_covers(&self, path: &[u8]) -> bool {
+        !self.daemon_failed && self.daemon.as_ref().is_some_and(|d| d.ready && fsys::in_scope(path, &d.root))
     }
 
     // ------------------------------------------------------------ model
@@ -407,6 +438,9 @@ impl App {
         };
         self.search_error = None;
         self.matcher = Some(m.clone());
+        if self.daemon_covers(&self.cwd) {
+            return self.run_daemon_query();
+        }
         if let Some(index) = self.indexes.iter().find(|i| i.covers(&self.cwd)).cloned() {
             return self.run_query(index, m);
         }
@@ -424,6 +458,35 @@ impl App {
             let index = build.run();
             let _ = tx.send(Msg::Built(index));
             ctx.request_repaint();
+        });
+    }
+
+    /// Ask the daemon: its index is always ready and current, so there is no
+    /// crawl. Rows come back without metadata; statting them here, as the
+    /// user, also confirms each result is still there and accessible.
+    fn run_daemon_query(&mut self) {
+        let generation = self.query_gen.fetch_add(1, Relaxed) + 1;
+        self.searching = true;
+        let current = self.query_gen.clone();
+        let (scope, text, regex, tx, ctx) = (self.cwd.clone(), self.query.clone(), self.regex, self.tx.clone(), self.ctx.clone());
+        let (sort, desc) = (self.sort, self.descending);
+        thread::spawn(move || {
+            let t = Instant::now();
+            let reply = proto::query(&scope, &text, regex, MAX_RESULTS as u32);
+            let query = t.elapsed();
+            let msg = match reply {
+                Ok(proto::Reply::Rows { mut rows, total }) => {
+                    let t = Instant::now();
+                    fsys::fill_meta(&mut rows);
+                    fsys::sort_rows(&mut rows, sort, desc);
+                    Msg::Results { generation, rows, total, query, meta: t.elapsed() }
+                }
+                _ => Msg::DaemonFailed { generation },
+            };
+            if current.load(Relaxed) == generation {
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -489,6 +552,14 @@ impl App {
                     self.scroll_to = Some(0);
                 }
                 Msg::Fonts(name) => self.font = name,
+                Msg::Daemon(st) => {
+                    self.daemon_failed = false;
+                    self.daemon = st;
+                }
+                Msg::DaemonFailed { generation } if generation == self.query_gen.load(Relaxed) => {
+                    self.daemon_failed = true;
+                    self.start_search();
+                }
                 _ => {}
             }
         }
@@ -691,7 +762,7 @@ impl App {
                 }
             }
 
-            let hint = if self.indexes.iter().any(|i| i.covers(&self.cwd)) { "Search (indexed)" } else { "Search" };
+            let hint = if self.daemon_covers(&self.cwd) || self.indexes.iter().any(|i| i.covers(&self.cwd)) { "Search (indexed)" } else { "Search" };
             let resp = ui.add(TextEdit::singleline(&mut self.query).id(egui::Id::unique("search_bar")).hint_text(hint).desired_width(search_w));
             if resp.changed() {
                 self.query_dirty = Some(Instant::now());
@@ -792,7 +863,14 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak("X11 prototype");
-                if let Some(i) = self.indexes.iter().find(|i| i.covers(&self.cwd)) {
+                if let (true, Some(d)) = (self.daemon_covers(&self.cwd), &self.daemon) {
+                    let age = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |n| n.as_secs().saturating_sub(d.verified_ns / 1_000_000_000));
+                    let live = if d.watched > 0 { "live" } else { "swept" };
+                    let paused = if d.paused.is_empty() { String::new() } else { format!(", paused: {}", d.paused) };
+                    ui.weak(format!("index: daemon, {} entries, {live}, verified {age} s ago{paused} ·", d.entries));
+                } else if let Some(i) = self.indexes.iter().find(|i| i.covers(&self.cwd)) {
                     ui.weak(format!(
                         "index: {} entries, {} dirs, {:.0} MB, crawled in {:.2} s ·",
                         i.entries,

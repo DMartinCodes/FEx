@@ -32,6 +32,10 @@ pub struct Meta {
     pub size: u64,
     /// Nanoseconds since the Unix epoch.
     pub mtime: i64,
+    /// Inode change time (ns). For a folder it changes whenever an entry is
+    /// added, removed or renamed, and on permission changes; unlike mtime it
+    /// can't be set back by `touch`, so it's the freshness signal.
+    pub ctime: i64,
     pub flags: u8,
 }
 
@@ -130,6 +134,11 @@ impl Dir {
         statx(self.fd, name, libc::AT_SYMLINK_NOFOLLOW)
     }
 
+    /// Metadata of this folder itself.
+    pub fn stat_self(&self) -> Option<Meta> {
+        statx(self.fd, b"", libc::AT_EMPTY_PATH)
+    }
+
     /// Whether `name` (a link) points at a folder.
     pub fn link_is_dir(&self, name: &[u8]) -> bool {
         statx(self.fd, name, 0).is_some_and(|m| m.flags & DIR != 0)
@@ -140,13 +149,19 @@ fn statx(dirfd: i32, name: &[u8], follow: i32) -> Option<Meta> {
     let c = cstr(name).ok()?;
     // SAFETY: statx is plain old data.
     let mut st: libc::statx = unsafe { std::mem::zeroed() };
-    let mask = libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_SIZE | libc::STATX_MTIME;
+    let mask = libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_CTIME;
     let rc = unsafe { libc::statx(dirfd, c.as_ptr(), follow | libc::AT_NO_AUTOMOUNT, mask, &mut st) };
     (rc == 0).then(|| Meta {
         size: st.stx_size,
         mtime: st.stx_mtime.tv_sec * 1_000_000_000 + st.stx_mtime.tv_nsec as i64,
+        ctime: st.stx_ctime.tv_sec * 1_000_000_000 + st.stx_ctime.tv_nsec as i64,
         flags: flags_of_mode(st.stx_mode as u32),
     })
+}
+
+/// Metadata of `path` itself (a final link is not followed).
+pub fn lstat(path: &[u8]) -> Option<Meta> {
+    statx(libc::AT_FDCWD, path, libc::AT_SYMLINK_NOFOLLOW)
 }
 
 /// Whether `path` exists and is (or links to) a folder.

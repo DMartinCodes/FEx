@@ -13,8 +13,10 @@ ranking), both platform-neutral.
 
 ```bash
 cargo build --release
-./target/release/fex [folder]
-./target/release/fex --bench /usr        # engine benchmark, no window
+./target/release/fex [folder]            # the file explorer (X11)
+sudo ./target/release/fex daemon         # the index daemon (see below)
+./target/release/fex query <text>        # search through the daemon
+./target/release/fex status              # daemon state
 ```
 
 Runtime libraries (X11; winit loads them at start, and FEx reports any that
@@ -32,57 +34,151 @@ Under a Wayland session FEx runs through XWayland.
 - Virtualized table (only visible rows are drawn), all I/O off the UI thread
 - Live updates of the open folder (inotify, coalesced per name)
 - Indexed search: keywords, `*`/`?` globs, `type:ext`, regex mode; exact
-  match count, results capped at 250,000 rows
+  match count, results capped at 250,000 rows. Uses the index daemon when
+  one is running and covers the folder, else builds an index in-process.
 - Type-to-find (same ranking as on Windows), keyboard navigation and
   selection, path bar with breadcrumbs (Ctrl+L), hidden files (Ctrl+H)
 - Sidebar: XDG user folders and mounted volumes (from `/proc/self/mountinfo`)
 - Open with the default application (`xdg-open`), copy path
 
 Not yet: file operations (copy/move/delete/rename, trash, undo), clipboard
-file transfer, drag and drop, tabs, properties, network browsing, saved
-indexes, live index freshness.
+file transfer, drag and drop, tabs, properties, network browsing.
+
+## Index daemon (`fex daemon`)
+
+A system service that keeps the whole machine's name index ready, so the
+first search is instant and nothing is crawled when FEx opens.
+
+```bash
+sudo install -m755 target/release/fex /usr/local/bin/fex
+sudo install -m644 packaging/linux/fex-indexd.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now fex-indexd
+```
+
+**Lifecycle.** On start it memory-maps its last snapshot
+(`/var/lib/fex/index.snap`, mode 0600) and answers at once, then verifies
+it: one `statx` per folder, comparing ctimes, re-reading only folders that
+changed while it was down. It then follows changes with fanotify
+filesystem marks (create, delete, rename; one mark per filesystem), with a
+full verification every 30 minutes as a safety net, and for filesystems
+fanotify can't watch. Network filesystems (NFS, CIFS, Lustre, ...) are not
+crawled unless `--include-network` is given: crawling them loads a shared
+server, and they report no changes made by other clients.
+
+**Snapshots.** The index arrays hold no pointers, so a snapshot is the
+arrays written out as they are; loading maps the file (no parsing). Every
+offset is validated on load, and files are replaced by atomic rename.
+Updates go to an in-memory overlay; saving compacts.
+
+**Freshness signal.** A folder's ctime changes whenever an entry is added,
+removed or renamed (and can't be set back like mtime). The index stores
+names only, so a folder's ctime is a complete signal for whether its part
+of the index is stale. Empty folders are recorded too.
+
+**Priorities.** Crawling and sweeping run on threads with `SCHED_IDLE` and
+the idle I/O class, and pause between folders when other processes' I/O
+stalls (PSI) exceed `--io-limit` (10%), memory is under pressure, or the
+machine is on battery. Queries and index updates run at normal priority, so
+a starved background thread never delays an answer.
+
+**Per-user visibility.** Each client sees only names in folders it could
+list itself:
+- Identity comes from the kernel (`SO_PEERCRED`, `SO_PEERGROUPS`), never
+  from the request; if groups can't be read, only the primary group counts.
+- Query workers take on the client's filesystem identity (fsuid, fsgid,
+  groups: per thread on Linux) and `open()` each folder that has matches.
+  That is the kernel's own check, so ACLs and search permission on every
+  ancestor count exactly. Decisions are cached per query (one check per
+  folder with matches), and hidden matches are left out of the count too.
+- Fail closed: a thread that couldn't take on the identity reports nothing.
+- Permission changes apply from the next query (checks are live).
+- Not covered: SELinux/AppArmor is evaluated in the daemon's domain, not
+  the client's.
+
+Tested with: owner-only folder, group folder (with and without the group),
+world-readable folder with an ACL denying the user, private folder with an
+ACL granting the user, and a world-readable folder inside a private one.
+
+**Protocol.** Unix socket `/run/fex/indexd.sock`; see `proto.rs`. Results
+carry names and types; clients stat what they show, as the user.
 
 ## Design decisions (from the discovery review)
 
 - **Names are bytes.** Linux filenames are any bytes except `/` and NUL, so
-  names and paths stay `[u8]` and are decoded only for display. Files with
-  invalid UTF-8 or newlines in their names can still be opened.
+  names and paths stay `[u8]` and are decoded only for display.
 - **Exact path identity.** Linux filesystems are case-sensitive; `Foo/` and
   `foo/` are different folders. Search matching stays case-insensitive.
 - **Names-only index.** `getdents64` returns only name and type; size and
-  date cost a `statx` per entry. The index records names and types, and
-  results get metadata after the query, which touches only what is shown.
-- **NUL-separated arena.** The one byte no filename contains separates names,
-  so storage is lossless and regexes use NUL as their line terminator. A bare
-  `type:ext` becomes a SIMD search for `.ext\0`.
-- **`statx` relative to the open folder** avoids resolving the path again
-  for every entry. Large folders are statted on the thread pool.
-- **Pseudo filesystems are skipped** (`/proc`, `/sys`, cgroups, ...) so
-  crawling `/` indexes only user files.
+  date cost a `statx` per entry, so results get metadata after the query.
+- **NUL-separated arena**, so storage is lossless and regexes use NUL as
+  their line terminator. A bare `type:ext` becomes a SIMD search for `.ext\0`.
+- **`statx` relative to the open folder**; large folders statted on the pool.
+- **Pseudo filesystems are skipped** (`/proc`, `/sys`, cgroups, ...).
 
-## Measured (4 threads, warm cache, release build)
+## Measured
 
-| | `/usr` (97.6K entries) | `/` (235K entries) |
+4 threads, release build, virtual disk; "cold" means after dropping the
+page, dentry and inode caches. Reproduce with `fex --bench`,
+`fex --bench-snapshot`, `fex --bench-interference`.
+
+Time to a searchable index:
+
+| Tree | Cache | Crawl | Map snapshot |
+|---|---|---|---|
+| `/usr` (98K entries, aged) | warm | 18.8 ms | 0.8 ms |
+| `/usr` | cold | 196 ms | 4.8 ms |
+| synthetic CFD tree (1.56M entries) | warm | 144 ms | 9.0 ms |
+| synthetic CFD tree | cold | 1,501 ms | 24.4 ms |
+
+Snapshot of 1.56M entries: 31.6 MB, written in 87 ms, mapped with no heap.
+
+Verifying a snapshot (ctime sweep, 4 threads): 61K folders 17.6 ms warm,
+290 ms cold.
+
+Daemon, whole machine (1.8M entries, 92K folders):
+- cold restart: first query answered 142 ms after launch, fully verified
+  after 826 ms (a cold crawl of `/` takes several seconds)
+- changes searchable via fanotify within 8–16 ms (create, rename, new
+  subtree, deleted subtree)
+- query round trip as root / as a filtered user: 2.9 / 3.5 ms (`conf`, 3K
+  matches); 132 / 144 ms (`p`, 650K matches, 250K rows sent)
+
+Background crawling beside a CPU-bound job on every core:
+
+| Phase | Job throughput | Crawl rate |
 |---|---|---|
-| crawl, names only | 13.5 ms (7.2 M entries/s) | 45 ms (5.2 M entries/s) |
-| crawl, names + `statx` | 34.9 ms (2.8 M entries/s) | 107 ms (2.2 M entries/s) |
-| query `conf` | 0.3 ms | 0.9 ms |
-| query `type:h` | — | 3.0 ms (was 23.7 ms before the `.ext\0` literal) |
-| metadata for results | 0.6–1.8 ms | 0.9–4.2 ms |
+| job alone | 100% | — |
+| job + crawler at normal priority | 53.6% | 5.1 M entries/s |
+| job + crawler at idle priority (daemon) | 100.2% | ~0 |
+| idle-priority crawler alone | — | 11.3 M entries/s |
 
-Recording metadata during the crawl costs 2.4–2.6x; filling it in for
-results costs milliseconds. Reproduce with `fex --bench <folder>`.
+Earlier engine numbers: recording metadata during the crawl costs
+2.4–2.6x; filling it in for results costs milliseconds.
+
+## Known limits and open decisions
+
+- **Cold metadata for results.** A snapshot holds names, not the kernel's
+  inode cache: after a cold boot, sizes and dates for ~1,000 results took
+  55 ms. The UI should show names at once and fill metadata progressively.
+- **Busy machines never index.** `SCHED_IDLE` gets almost no CPU on a box
+  that is always fully loaded, so a first crawl there may not finish. A
+  floor (nice 19 instead of `SCHED_IDLE`, about 1.5% of a core under load)
+  would guarantee progress.
+- **Large result sets** spend their time sending 250K rows over the socket;
+  sending the first screenful plus the count, then pages, would fix that.
+- Not tested under systemd here (the test container has no systemd); the
+  unit file is untested, and PSI self-throttling is only accurate inside a
+  cgroup of its own, as the service runs.
+- The daemon indexes one root (default `/`); fanotify needs kernel 5.1+
+  (Rocky 8's 4.18 falls back to periodic sweeps).
 
 ## Next steps
 
-1. **Index freshness:** inotify per folder up to a watch budget, then a sweep
-   that re-reads folders whose mtime changed (statting folders only).
-2. **File operations:** `renameat2` (`RENAME_NOREPLACE`), `copy_file_range`
+1. Decide on the busy-machine floor and progressive result metadata.
+2. File operations: `renameat2` (`RENAME_NOREPLACE`), `copy_file_range`
    (reflinks on Btrfs/XFS, server-side copy on NFS 4.2/SMB3) in the existing
-   parallel, largest-first transfer design; freedesktop Trash for delete/undo.
-3. **Clipboard and drag and drop:** `text/uri-list` and
-   `x-special/gnome-copied-files` for copy/paste with Nautilus and others;
-   XDND for dragging files out (winit has no drag-out on any platform).
-4. Convergence: move the shared index core to byte names so Windows and
-   Linux use one implementation (no cost on Windows, whose names are already
-   stored as UTF-8).
+   parallel, largest-first transfer design; freedesktop Trash.
+3. Clipboard and drag and drop: `text/uri-list` and
+   `x-special/gnome-copied-files`; XDND for dragging files out.
+4. Windows service: the same index core and protocol (named pipe), the NTFS
+   change journal instead of fanotify, background mode for priorities.
