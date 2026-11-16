@@ -136,6 +136,7 @@ impl<T: Pod> Buf<T> {
     }
 }
 
+#[cfg(test)]
 fn as_bytes<T: Pod>(v: &[T]) -> &[u8] {
     // SAFETY: Pod types have no padding.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, size_of_val(v)) }
@@ -151,8 +152,34 @@ pub struct Info {
     pub build_ns: u64,
 }
 
+#[cfg(test)]
 /// Write `sections` (raw bytes, in order) to `path` atomically.
 pub fn write(path: &Path, info: Info, sections: &[&[u8]; SECTIONS]) -> io::Result<()> {
+    write_streamed(path, info, sections.map(<[u8]>::len), |i, w| w.write_all(sections[i]))
+}
+
+/// Counts what passes through, to check each section's declared length.
+struct Counting<'a, W: Write> {
+    inner: &'a mut W,
+    n: usize,
+}
+
+impl<W: Write> Write for Counting<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.n += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write a snapshot whose section `i` is `lens[i]` bytes produced by
+/// `fill(i, writer)`, without holding the sections in memory. Written to a
+/// temp name, synced, then renamed over `path`. A section of another length
+/// than declared is an error and leaves `path` untouched.
+pub fn write_streamed(path: &Path, info: Info, lens: [usize; SECTIONS], mut fill: impl FnMut(usize, &mut dyn Write) -> io::Result<()>) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
     let mut header = Vec::with_capacity(HEADER + SECTIONS * 16);
@@ -166,19 +193,24 @@ pub fn write(path: &Path, info: Info, sections: &[&[u8]; SECTIONS]) -> io::Resul
     header.extend_from_slice(&0u32.to_le_bytes());
     let mut off = (HEADER + SECTIONS * 16).next_multiple_of(ALIGN);
     let mut layout = Vec::new();
-    for s in sections {
+    for &len in &lens {
         header.extend_from_slice(&(off as u64).to_le_bytes());
-        header.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        header.extend_from_slice(&(len as u64).to_le_bytes());
         layout.push(off);
-        off = (off + s.len()).next_multiple_of(ALIGN);
+        off = (off + len).next_multiple_of(ALIGN);
     }
     let mut w = io::BufWriter::with_capacity(1 << 20, &mut f);
     w.write_all(&header)?;
     let mut pos = header.len();
-    for (s, &at) in sections.iter().zip(&layout) {
+    for (i, &at) in layout.iter().enumerate() {
         w.write_all(&vec![0u8; at - pos])?;
-        w.write_all(s)?;
-        pos = at + s.len();
+        let mut c = Counting { inner: &mut w, n: 0 };
+        fill(i, &mut c)?;
+        if c.n != lens[i] {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io::Error::other(format!("snapshot section {i}: wrote {} bytes, declared {}", c.n, lens[i])));
+        }
+        pos = at + lens[i];
     }
     w.flush()?;
     drop(w);
@@ -187,6 +219,7 @@ pub fn write(path: &Path, info: Info, sections: &[&[u8]; SECTIONS]) -> io::Resul
     Ok(())
 }
 
+#[cfg(test)]
 pub fn section<T: Pod>(v: &[T]) -> &[u8] {
     as_bytes(v)
 }

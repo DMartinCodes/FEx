@@ -137,6 +137,60 @@ pub fn sort_rows(rows: &mut [Row], key: SortKey, descending: bool) {
     rows.sort_unstable_by(|a, b| cmp_rows(a, b, key, descending));
 }
 
+/// `sort_rows` for big result sets: chunks sorted on the pool, then merged
+/// pairwise, each round's merges in parallel too.
+pub fn sort_rows_par(rows: &mut Vec<Row>, key: SortKey, descending: bool) {
+    let threads = pool::threads();
+    if rows.len() < 16 * 1024 || threads < 2 {
+        return sort_rows(rows, key, descending);
+    }
+    let cmp = |a: &Row, b: &Row| cmp_rows(a, b, key, descending);
+    let size = rows.len().div_ceil(threads);
+    let mut all = std::mem::take(rows);
+    let mut parts: Vec<Vec<Row>> = Vec::with_capacity(threads);
+    while all.len() > size {
+        let tail = all.split_off(all.len() - size);
+        parts.push(tail);
+    }
+    parts.push(all);
+    let chunks: Vec<Mutex<Vec<Row>>> = parts.into_iter().map(Mutex::new).collect();
+    pool::for_each(chunks.len(), &|i| chunks[i].lock().unwrap_or_else(PoisonError::into_inner).sort_unstable_by(cmp));
+    let mut parts: Vec<Vec<Row>> = chunks.into_iter().map(|c| c.into_inner().unwrap_or_else(PoisonError::into_inner)).collect();
+    while parts.len() > 1 {
+        let odd = (parts.len() % 2 == 1).then(|| parts.pop()).flatten();
+        let pairs: Vec<Mutex<(Vec<Row>, Vec<Row>)>> = {
+            let mut it = parts.into_iter();
+            std::iter::from_fn(|| Some(Mutex::new((it.next()?, it.next()?)))).collect()
+        };
+        pool::for_each(pairs.len(), &|i| {
+            let mut pair = pairs[i].lock().unwrap_or_else(PoisonError::into_inner);
+            let (a, b) = std::mem::take(&mut *pair);
+            pair.0 = merge(a, b, cmp);
+        });
+        parts = pairs.into_iter().map(|p| p.into_inner().unwrap_or_else(PoisonError::into_inner).0).collect();
+        parts.extend(odd);
+    }
+    *rows = parts.pop().unwrap_or_default();
+}
+
+fn merge(a: Vec<Row>, b: Vec<Row>, cmp: impl Fn(&Row, &Row) -> Ordering) -> Vec<Row> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
+    loop {
+        match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) => out.extend(if cmp(y, x).is_lt() { b.next() } else { a.next() }),
+            (Some(_), None) => {
+                out.extend(a);
+                return out;
+            }
+            (None, _) => {
+                out.extend(b);
+                return out;
+            }
+        }
+    }
+}
+
 /// Folders above this size get their entries statted on the thread pool.
 const PARALLEL_STAT: usize = 2048;
 
@@ -163,7 +217,8 @@ pub fn list_dir(path: &[u8]) -> Result<Vec<Row>, String> {
     if rows.len() < PARALLEL_STAT || pool::threads() < 2 {
         rows.iter_mut().for_each(fill);
     } else {
-        let chunks: Vec<Mutex<&mut [Row]>> = rows.chunks_mut(512).map(Mutex::new).collect();
+        let chunk = (rows.len() / (pool::threads() * 4)).clamp(128, 1024);
+        let chunks: Vec<Mutex<&mut [Row]>> = rows.chunks_mut(chunk).map(Mutex::new).collect();
         pool::for_each(chunks.len(), &|i| {
             chunks[i].lock().unwrap_or_else(PoisonError::into_inner).iter_mut().for_each(fill);
         });
@@ -175,7 +230,9 @@ pub fn list_dir(path: &[u8]) -> Result<Vec<Row>, String> {
 /// results), on the pool. Consecutive rows from the same folder share one
 /// open handle, so most lookups are relative.
 pub fn fill_meta(rows: &mut [Row]) {
-    let chunks: Vec<Mutex<&mut [Row]>> = rows.chunks_mut(1024).map(Mutex::new).collect();
+    // Enough chunks to keep every pool thread busy, however few rows.
+    let chunk = (rows.len() / (pool::threads() * 4)).clamp(16, 1024);
+    let chunks: Vec<Mutex<&mut [Row]>> = rows.chunks_mut(chunk).map(Mutex::new).collect();
     pool::for_each(chunks.len(), &|i| {
         let mut chunk = chunks[i].lock().unwrap_or_else(PoisonError::into_inner);
         let mut open: Option<(Arc<[u8]>, Option<Dir>)> = None;
@@ -348,6 +405,21 @@ mod tests {
         let mut v: Vec<&[u8]> = vec![b"b", b"A", b"a", b"\xc3\x89t\xc3\xa9", b"e"];
         v.sort_by(|a, b| cmp_names(a, b));
         assert_eq!(v, vec![&b"A"[..], b"a", b"b", b"e", b"\xc3\x89t\xc3\xa9"]);
+    }
+
+    #[test]
+    fn parallel_sort_matches_sort() {
+        let mut rows: Vec<Row> = (0..40_000u32)
+            .map(|i| {
+                let n = (i.wrapping_mul(2_654_435_761) % 100_000).to_string();
+                Row { name: n.into_bytes().into(), dir: None, size: (i % 97) as u64, mtime: 0, flags: if i % 7 == 0 { DIR } else { 0 }, sel: false, id: i }
+            })
+            .collect();
+        let mut want = rows.clone();
+        sort_rows(&mut want, SortKey::Size, true);
+        sort_rows_par(&mut rows, SortKey::Size, true);
+        let key = |r: &Row| (r.flags, r.size, r.name.clone());
+        assert_eq!(rows.iter().map(key).collect::<Vec<_>>(), want.iter().map(key).collect::<Vec<_>>());
     }
 
     #[test]

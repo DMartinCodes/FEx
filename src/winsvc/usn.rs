@@ -31,6 +31,20 @@ pub struct Position {
 
 struct Volume(HANDLE);
 
+/// A volume shared by the pool's threads during a catch-up.
+struct SharedVolume<'a>(&'a Volume);
+
+// SAFETY: a volume handle may be used from several threads at once
+// (OpenFileById and DeviceIoControl take it as a plain argument).
+unsafe impl Sync for SharedVolume<'_> {}
+
+impl SharedVolume<'_> {
+    // A method, so closures capture the wrapper rather than its field.
+    fn volume(&self) -> &Volume {
+        self.0
+    }
+}
+
 impl Drop for Volume {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.0) };
@@ -154,7 +168,15 @@ pub fn changed_since(root: &str, since: Position) -> CatchUp {
     if read.is_none() || overflow {
         return CatchUp::Lost;
     }
-    CatchUp::Dirs(parents.into_iter().filter_map(|frn| path_of(&vol, frn)).collect())
+    // Resolving each folder is a file open: spread them over the pool.
+    let frns: Vec<u64> = parents.into_iter().collect();
+    let found: Vec<std::sync::Mutex<Vec<String>>> = (0..frns.len().div_ceil(256)).map(|_| Default::default()).collect();
+    let shared = SharedVolume(&vol);
+    crate::pool::for_each(found.len(), &|c| {
+        let mine: Vec<String> = frns[c * 256..((c + 1) * 256).min(frns.len())].iter().filter_map(|&frn| path_of(shared.volume(), frn)).collect();
+        *found[c].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = mine;
+    });
+    CatchUp::Dirs(found.into_iter().flat_map(|m| m.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)).collect())
 }
 
 /// Follows a volume's journal from now on (for cache invalidation).
@@ -176,16 +198,22 @@ impl Tail {
         Some(Tail { vol, pos: Position { journal: d.UsnJournalID, next: d.NextUsn } })
     }
 
-    /// Records with any of `reasons` since the last poll, each with its
-    /// parent folder's current path when it still exists.
-    pub fn poll(&mut self, reasons: u32) -> Polled {
+    /// Records with any of `reasons` since the last poll (`dirs_only`: of
+    /// folders only, before any path is resolved), each with its parent
+    /// folder's current path when it still exists.
+    pub fn poll(&mut self, reasons: u32, dirs_only: bool) -> Polled {
         let Some(now) = query(&self.vol) else { return Polled::Lost };
         if now.UsnJournalID != self.pos.journal || self.pos.next < now.FirstUsn {
             self.pos = Position { journal: now.UsnJournalID, next: now.NextUsn };
             return Polled::Lost;
         }
         let mut out = Vec::new();
-        match read_records(&self.vol, self.pos.journal, self.pos.next, now.NextUsn, reasons, |r| out.push(r)) {
+        const DIRECTORY: u32 = 0x10;
+        match read_records(&self.vol, self.pos.journal, self.pos.next, now.NextUsn, reasons, |r| {
+            if !dirs_only || r.attrs & DIRECTORY != 0 {
+                out.push(r);
+            }
+        }) {
             Some(next) => self.pos.next = next.max(self.pos.next),
             None => {
                 self.pos = Position { journal: now.UsnJournalID, next: now.NextUsn };
@@ -275,7 +303,7 @@ mod tests {
             CatchUp::Lost => panic!("journal lost"),
         }
         let created = 0x100; // USN_REASON_FILE_CREATE
-        match tail.poll(created) {
+        match tail.poll(created, true) {
             Polled::Records(rs) => assert!(
                 rs.iter().any(|(r, p)| r.name == "made_after" && r.attrs & 0x10 != 0 && p.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&base_s))),
                 "folder creation not seen in {} records",

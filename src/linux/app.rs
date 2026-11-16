@@ -650,8 +650,11 @@ impl App {
         });
     }
 
-    /// Give arriving rows ids, sort, and queue them for metadata.
-    fn add_result_rows(&mut self, mut rows: Vec<Row>) {
+    /// Give arriving rows ids and queue them for metadata. Streamed rows are
+    /// appended as they come (the first screenful already arrives in order)
+    /// and the whole set is sorted once, in parallel, when `sort` is set: for
+    /// the first batch and when the last one has arrived.
+    fn add_result_rows(&mut self, mut rows: Vec<Row>, sort: bool) {
         let Some(r) = self.results.as_mut() else { return };
         let base = r.rows.len() as u32;
         for (i, row) in rows.iter_mut().enumerate() {
@@ -663,11 +666,22 @@ impl App {
         if let Some(b) = &r.backfill {
             let _ = b.send(Fill::Add(rows.iter().filter(|row| row.size == 0 && row.mtime == 0).map(|row| (row.id, (row.dir.clone().unwrap_or_else(|| self.cwd.as_slice().into()), row.name.clone()))).collect()));
         }
+        if !sort {
+            let hidden = self.show_hidden;
+            let start = r.rows.len();
+            r.pos.resize(start + rows.len(), 0);
+            for (i, row) in rows.iter().enumerate() {
+                r.pos[row.id as usize] = (start + i) as u32;
+            }
+            self.view.extend((start..start + rows.len()).filter(|&i| hidden || !rows[i - start].is_hidden()));
+            r.rows.extend(rows);
+            return;
+        }
         r.rows.extend(rows);
         let keep = self.focus_path();
         let (key, desc) = (self.sort, self.descending);
         if let Some(r) = self.results.as_mut() {
-            fsys::sort_rows(&mut r.rows, key, desc);
+            fsys::sort_rows_par(&mut r.rows, key, desc);
             r.reindex();
         }
         self.rebuild_view(keep);
@@ -744,7 +758,7 @@ impl App {
                         backfill: Some(fill_tx),
                         prioritized: Vec::new(),
                     });
-                    self.add_result_rows(rows);
+                    self.add_result_rows(rows, true);
                     self.focus = None;
                     self.scroll_to = Some(0);
                     if complete {
@@ -752,7 +766,7 @@ impl App {
                     }
                 }
                 Msg::MoreRows { generation, rows, complete } if generation == self.query_gen.load(Relaxed) => {
-                    self.add_result_rows(rows);
+                    self.add_result_rows(rows, complete);
                     if let (true, Some(r)) = (complete, self.results.as_mut()) {
                         r.all = Some(r.started.elapsed());
                     }

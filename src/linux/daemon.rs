@@ -299,18 +299,18 @@ fn sd_notify(msg: &str) {
 
 fn save(sh: &Shared, snap: &Path, remap: bool) {
     let t = Instant::now();
-    // The image is built under the read lock; the disk write and fsync
-    // happen after it is released.
-    let (image, generation) = {
+    // Streamed from the index under the read lock, with no copy of it.
+    // Queries aren't held up: a read lock only stalls them when a writer is
+    // waiting, and the only writer is this (maintenance) thread.
+    let generation = {
         let guard = sh.index.read().unwrap_or_else(PoisonError::into_inner);
         let Some(idx) = guard.as_ref() else { return };
-        (idx.save_image(), idx.generation)
+        if let Err(e) = idx.save(snap) {
+            log(&format!("saving {}: {e}", snap.display()));
+            return;
+        }
+        idx.generation
     };
-    if let Err(e) = image.write(snap) {
-        log(&format!("saving {}: {e}", snap.display()));
-        return;
-    }
-    drop(image);
     sh.dirty.store(false, Relaxed);
     let saved = t.elapsed();
     // Swapping in the mapped, compacted copy frees the heap copy. Only this

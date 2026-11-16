@@ -771,42 +771,68 @@ impl Index {
 
     // ------------------------------------------------------------ snapshots
 
-    /// All live listings in one shard, in folder order.
-    fn compacted(&self) -> Shard {
-        let mut out = Shard::default();
-        for (s, shard) in self.shards.iter().enumerate() {
-            for d in 0..shard.ndirs() {
-                if self.dead[s][d] {
-                    continue;
-                }
-                out.begin_dir(shard.dir_path(d), shard.dir_ctime[d]);
-                let (a, b) = shard.range(d);
-                for i in a..b {
-                    out.push(shard.name(i), shard.entry_flags[i]);
+    /// Write the live index to `path` as a snapshot (compacting it), streamed
+    /// straight from the listings: no second copy of the index in memory.
+    /// Each folder's entries are contiguous in its shard, so names go out as
+    /// whole slices and offsets are rebased on the way.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let live: Vec<(usize, usize)> =
+            (0..self.shards.len()).flat_map(|s| (0..self.shards[s].ndirs()).filter(move |&d| !self.dead[s][d]).map(move |d| (s, d))).collect();
+        let (mut entries, mut name_bytes, mut path_bytes) = (0usize, 0usize, 0usize);
+        for &(s, d) in &live {
+            let sh = &self.shards[s];
+            let (a, b) = sh.range(d);
+            entries += b - a;
+            if b > a {
+                name_bytes += sh.end_of(b) - sh.starts[a] as usize;
+            }
+            path_bytes += sh.dir_path(d).len();
+        }
+        if name_bytes > u32::MAX as usize || path_bytes > u32::MAX as usize || entries > u32::MAX as usize {
+            return Err(std::io::Error::other("index too large for one snapshot shard"));
+        }
+        let nd = live.len();
+        let info = snapshot::Info { created_ns: now_ns(), entries: entries as u64, dirs: nd as u64, errors: self.errors as u64, build_ns: self.build_time.as_nanos() as u64 };
+        let lens = [self.root.len(), name_bytes, name_bytes, 4 * entries, 4 * entries, entries, path_bytes, 4 * nd, 8 * nd, 8 * nd];
+        snapshot::write_streamed(path, info, lens, |i, w| {
+            if i == 0 {
+                return w.write_all(&self.root);
+            }
+            let (mut off, mut at) = (0u32, 0u32);
+            for (nd, &(s, d)) in live.iter().enumerate() {
+                let sh = &self.shards[s];
+                let (a, b) = sh.range(d);
+                match i {
+                    1 | 2 if b > a => w.write_all(&(if i == 1 { &sh.names } else { &sh.lower })[sh.starts[a] as usize..sh.end_of(b)])?,
+                    3 => {
+                        for e in a..b {
+                            w.write_all(&off.to_le_bytes())?;
+                            off += (sh.end_of(e + 1) - sh.starts[e] as usize) as u32;
+                        }
+                    }
+                    4 => {
+                        for _ in a..b {
+                            w.write_all(&(nd as u32).to_le_bytes())?;
+                        }
+                    }
+                    5 => w.write_all(&sh.entry_flags[a..b])?,
+                    6 => w.write_all(sh.dir_path(d))?,
+                    7 => {
+                        w.write_all(&off.to_le_bytes())?;
+                        off += sh.dir_path(d).len() as u32;
+                    }
+                    8 => {
+                        let n = (b - a) as u32;
+                        w.write_all(&at.to_le_bytes())?;
+                        w.write_all(&(at + n).to_le_bytes())?;
+                        at += n;
+                    }
+                    9 => w.write_all(&sh.dir_ctime[d].to_le_bytes())?,
+                    _ => {}
                 }
             }
-        }
-        out
-    }
-
-    /// Write the live index to `path` as a snapshot (compacting it).
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        self.save_image().write(path)
-    }
-
-    /// The compacted snapshot contents, in memory: take this under the index
-    /// lock, then `write` it with the lock released (disk I/O and fsync
-    /// shouldn't hold up updates, or the queries queued behind them).
-    pub fn save_image(&self) -> SaveImage {
-        let c = self.compacted();
-        let info = snapshot::Info {
-            created_ns: now_ns(),
-            entries: c.len() as u64,
-            dirs: c.ndirs() as u64,
-            errors: self.errors as u64,
-            build_ns: self.build_time.as_nanos() as u64,
-        };
-        SaveImage { root: self.root.clone(), shard: c, info }
+            Ok(())
+        })
     }
 
     /// Map a snapshot. Its data is as fresh as when it was written; `sweep`
@@ -851,32 +877,6 @@ fn subtree(map: &FolderMap, root: &[u8]) -> Vec<(Box<[u8]>, DirRef)> {
     let hi = [trimmed, b"0"].concat();
     out.extend(map.range::<[u8], _>((Bound::Included(&lo[..]), Bound::Excluded(&hi[..]))).map(|(k, v)| (k.clone(), *v)));
     out
-}
-
-/// A snapshot ready to be written (see `Index::save_image`).
-pub struct SaveImage {
-    root: Arc<[u8]>,
-    shard: Shard,
-    info: snapshot::Info,
-}
-
-impl SaveImage {
-    pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        let c = &self.shard;
-        let secs: [&[u8]; snapshot::SECTIONS] = [
-            &self.root,
-            &c.names,
-            &c.lower,
-            snapshot::section(&c.starts),
-            snapshot::section(&c.entry_dir),
-            &c.entry_flags,
-            &c.dir_paths,
-            snapshot::section(&c.dir_starts),
-            snapshot::section(&c.ranges),
-            snapshot::section(&c.dir_ctime),
-        ];
-        snapshot::write(path, self.info, &secs)
-    }
 }
 
 // ------------------------------------------------------------ crawling

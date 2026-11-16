@@ -170,6 +170,10 @@ struct Drive {
     live: RwLock<Option<Arc<Live>>>,
     /// The watcher lost changes: crawl again.
     stale: Arc<AtomicBool>,
+    /// The index is current to the disk (crawled, or fully caught up from
+    /// the journal). Until then it isn't saved: the previous saved index and
+    /// position stay, so the next start can resume the catch-up.
+    caught_up: AtomicBool,
     last_save: Mutex<Instant>,
 }
 
@@ -219,7 +223,7 @@ pub fn run(cfg: Config, ready: impl FnOnce()) {
         drives: cfg
             .roots
             .iter()
-            .map(|r| Drive { root: r.clone(), tracked: AtomicBool::new(false), live: RwLock::new(None), stale: Arc::new(AtomicBool::new(false)), last_save: Mutex::new(Instant::now()) })
+            .map(|r| Drive { root: r.clone(), tracked: AtomicBool::new(false), caught_up: AtomicBool::new(false), live: RwLock::new(None), stale: Arc::new(AtomicBool::new(false)), last_save: Mutex::new(Instant::now()) })
             .collect(),
         throttle: Throttle::start(cfg.reserve.unwrap_or(profile.reserve), profile.cores),
         sds: Descriptors::default(),
@@ -291,6 +295,7 @@ fn crawl(sh: &Arc<Shared>, d: &Drive) -> Option<usize> {
     let entries = idx.entries;
     log(&format!("crawled {}: {entries} entries in {:.1} s ({} unreadable)", d.root, t.elapsed().as_secs_f64(), idx.errors));
     d.stale.store(false, Relaxed);
+    d.caught_up.store(true, Relaxed);
     let live = Live::new(idx, build.take_freshener(), on_change(d.stale.clone()));
     *d.live.write().unwrap_or_else(PoisonError::into_inner) = Some(live);
     save_drive(sh, d, false);
@@ -303,6 +308,9 @@ fn crawl(sh: &Arc<Shared>, d: &Drive) -> Option<usize> {
 /// dropped: the next start must crawl rather than trust it.
 fn save_drive(sh: &Shared, d: &Drive, only_dirty: bool) {
     let Some(live) = d.live.read().unwrap_or_else(PoisonError::into_inner).clone() else { return };
+    if !d.caught_up.load(Relaxed) {
+        return; // keep the previous save (and position) to resume from
+    }
     if d.stale.load(Relaxed) {
         let _ = std::fs::remove_file(saved_paths(&sh.dir, &d.root).1);
         log(&format!("{}: not saved (changes were lost); it will be crawled at the next start", d.root));
@@ -364,39 +372,59 @@ fn save_drive(sh: &Shared, d: &Drive, only_dirty: bool) {
     }
 }
 
+/// Load a drive's saved index and catch it up from the change journal.
+/// Returns whether the drive still needs a crawl.
+fn load_drive(sh: &Arc<Shared>, d: &Drive) -> bool {
+    // Watch before loading, so nothing in between is missed.
+    let fresh = index::Freshener::start_ignoring(d.root.as_str().into(), sh.own.clone());
+    let (idx_path, pos_path) = saved_paths(&sh.dir, &d.root);
+    let t = Instant::now();
+    let loaded = Index::load(&idx_path).filter(|i| index::in_scope(&d.root, &i.root) && index::in_scope(&i.root, &d.root));
+    let Some(idx) = loaded else { return true };
+    log(&format!("loaded {}: {} entries in {:.0} ms", d.root, idx.entries, t.elapsed().as_secs_f64() * 1e3));
+    let live = Live::new(idx, Some(fresh), on_change(d.stale.clone()));
+    *d.live.write().unwrap_or_else(PoisonError::into_inner) = Some(live.clone());
+    let t = Instant::now();
+    match usn::load(&pos_path).map(|p| usn::changed_since(&d.root, p)) {
+        Some(CatchUp::Dirs(dirs)) => {
+            let n = dirs.len();
+            let mut read = 0;
+            // In batches, so a stop request isn't held up by a long catch-up.
+            for batch in dirs.chunks(1024) {
+                if STOP.load(Relaxed) {
+                    log(&format!("{}: catch-up interrupted; it resumes at the next start", d.root));
+                    return false;
+                }
+                read += index::refresh_dirs(&live.index, batch.to_vec());
+            }
+            d.caught_up.store(true, Relaxed);
+            log(&format!("caught up {} from the change journal: {n} folders changed, {read} re-read in {:.0} ms", d.root, t.elapsed().as_secs_f64() * 1e3));
+            false
+        }
+        Some(CatchUp::Lost) | None => {
+            log(&format!("{}: changes since the last save can't be replayed; crawling in the background", d.root));
+            true
+        }
+    }
+}
+
 fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
+    // Every drive's saved index first, all at once: a drive that needs a
+    // long crawl mustn't keep the others offline.
+    sh.set_activity("loading");
+    let needs: Vec<bool> = thread::scope(|sc| {
+        let handles: Vec<_> = sh.drives.iter().map(|d| sc.spawn(move || load_drive(sh, d))).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(true)).collect()
+    });
+    // Then the crawls, one at a time (each uses every core it may).
     let mut crawled = 0u64;
-    for d in &sh.drives {
+    for (d, &need) in sh.drives.iter().zip(&needs) {
         if STOP.load(Relaxed) {
             return;
         }
-        // Watch before loading, so nothing in between is missed.
-        let fresh = index::Freshener::start_ignoring(d.root.as_str().into(), sh.own.clone());
-        let (idx_path, pos_path) = saved_paths(&sh.dir, &d.root);
-        let t = Instant::now();
-        let loaded = Index::load(&idx_path).filter(|i| index::in_scope(&d.root, &i.root) && index::in_scope(&i.root, &d.root));
-        let pos = usn::load(&pos_path);
-        let Some(idx) = loaded else {
+        if need {
             sh.set_activity("crawling");
             crawled += crawl(sh, d).unwrap_or(0) as u64;
-            continue;
-        };
-        log(&format!("loaded {}: {} entries in {:.0} ms", d.root, idx.entries, t.elapsed().as_secs_f64() * 1e3));
-        let live = Live::new(idx, Some(fresh), on_change(d.stale.clone()));
-        *d.live.write().unwrap_or_else(PoisonError::into_inner) = Some(live.clone());
-        sh.set_activity("catching up");
-        let t = Instant::now();
-        match pos.map(|p| usn::changed_since(&d.root, p)) {
-            Some(CatchUp::Dirs(dirs)) => {
-                let n = dirs.len();
-                let read = index::refresh_dirs(&live.index, dirs);
-                log(&format!("caught up {} from the change journal: {n} folders changed, {read} re-read in {:.0} ms", d.root, t.elapsed().as_secs_f64() * 1e3));
-            }
-            Some(CatchUp::Lost) | None => {
-                log(&format!("{}: changes since the last save can't be replayed; crawling in the background", d.root));
-                sh.set_activity("crawling");
-                crawled += crawl(sh, d).unwrap_or(0) as u64;
-            }
         }
     }
     sh.verified_ns.store(now_ns(), Relaxed);
@@ -416,6 +444,10 @@ fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
     }
     while !STOP.load(Relaxed) {
         thread::sleep(Duration::from_secs(1));
+        if sh.sds.take_cleared() {
+            prefetch_descriptors(sh);
+            sh.set_activity("idle");
+        }
         for d in &sh.drives {
             if STOP.load(Relaxed) {
                 break;
@@ -468,18 +500,17 @@ fn prefetch_descriptors(sh: &Arc<Shared>) {
 }
 
 /// Keep the descriptor cache true to the disk: follow each drive's change
-/// journal every second. A permission change anywhere clears the cache. A
-/// folder created drops its entry (its path may have named another folder);
-/// a folder deleted or renamed, at its old or new path, drops its whole
-/// subtree's (subfolders move with it, without records of their own).
+/// journal every second (folder records only). A folder created drops its
+/// entry (its path may have named another folder); a folder deleted,
+/// renamed (old or new path) or given a new ACL drops its whole subtree's
+/// (subfolders move with it without records of their own). Only records
+/// that can't be placed, or a lost journal, clear the cache, which is then
+/// read again in the background.
 fn follow_permissions(sh: &Arc<Shared>) {
     const SECURITY: u32 = 0x800;
     const CREATE: u32 = 0x100;
     const MOVED: u32 = 0x200 | 0x1000 | 0x2000; // delete, rename old/new name
     const NAMES: u32 = CREATE | MOVED;
-    const DIRECTORY: u32 = 0x10;
-    /// More subtrees than this in one poll: clearing is cheaper.
-    const MAX_TREES: usize = 64;
     let mut tails: Vec<Option<usn::Tail>> = sh.drives.iter().map(|d| usn::Tail::start(&d.root)).collect();
     for (d, t) in sh.drives.iter().zip(&tails) {
         d.tracked.store(t.is_some(), Relaxed);
@@ -490,10 +521,10 @@ fn follow_permissions(sh: &Arc<Shared>) {
     while !STOP.load(Relaxed) {
         thread::sleep(Duration::from_secs(1));
         for tail in tails.iter_mut().flatten() {
-            match tail.poll(SECURITY | NAMES) {
+            match tail.poll(SECURITY | NAMES, true) {
                 Polled::Lost => sh.sds.clear(),
                 Polled::Records(records) => {
-                    let dirs: Vec<_> = records.into_iter().filter(|(r, _)| r.attrs & DIRECTORY != 0).collect();
+                    let dirs = records;
                     let mut trees = Vec::new();
                     let mut created = Vec::new();
                     let mut unresolved = false;
@@ -505,13 +536,17 @@ fn follow_permissions(sh: &Arc<Shared>) {
                             continue;
                         };
                         let path = fsys::join(p, &r.name);
-                        if r.reason & MOVED != 0 {
+                        // A folder's own ACL change: its descriptor and its
+                        // subtree's (inherited entries are rewritten, each
+                        // with a record of its own, but forgetting the subtree
+                        // costs no more than a range).
+                        if r.reason & (MOVED | SECURITY) != 0 {
                             trees.push(path);
                         } else {
                             created.push(path);
                         }
                     }
-                    if unresolved || trees.len() > MAX_TREES || dirs.iter().any(|(r, _)| r.reason & SECURITY != 0) || dirs.len() > 5000 {
+                    if unresolved {
                         sh.sds.clear();
                     } else {
                         if !trees.is_empty() {

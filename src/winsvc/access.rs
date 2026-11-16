@@ -22,7 +22,9 @@
 //! (kept in the SACL, which needs extra privilege to read); the default
 //! policy only restricts writing up, not listing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use windows_sys::Win32::Foundation::{HANDLE, LUID};
@@ -74,11 +76,15 @@ fn read_sd(path: &str) -> Option<Sd> {
 #[derive(Default)]
 pub struct Descriptors {
     inner: RwLock<Inner>,
+    /// Set by `clear`, so the service can read descriptors again in the
+    /// background rather than inside the next queries.
+    cleared: AtomicBool,
 }
 
 #[derive(Default)]
 struct Inner {
-    by_path: HashMap<Box<str>, Arc<Sd>>,
+    /// Ordered, so a folder's subtree is one range of keys.
+    by_path: BTreeMap<Box<str>, Arc<Sd>>,
     distinct: HashMap<Box<[u64]>, Arc<Sd>>,
     epoch: u64,
 }
@@ -87,10 +93,6 @@ fn key(path: &str) -> Box<str> {
     path.trim_end_matches('\\').to_lowercase().into()
 }
 
-/// `k` is `prefix` or lies beneath it (both keys).
-fn under(k: &str, prefix: &str) -> bool {
-    k.starts_with(prefix) && (k.len() == prefix.len() || k.as_bytes()[prefix.len()] == b'\\')
-}
 
 impl Descriptors {
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
@@ -137,9 +139,18 @@ impl Descriptors {
     /// Drop the entries of folders at or beneath `paths` (deleted or renamed:
     /// their subfolders moved with them, without journal records of their own).
     pub fn forget_trees(&self, paths: &[String]) {
-        let prefixes: Vec<Box<str>> = paths.iter().map(|p| key(p)).collect();
         let mut g = self.write();
-        g.by_path.retain(|k, _| !prefixes.iter().any(|p| under(k, p)));
+        for p in paths {
+            // The folder, then everything under `p\`: keys between `p\` and
+            // `p]` (']' follows '\'), whatever else sorts near `p`.
+            let k = key(p);
+            g.by_path.remove(&k);
+            let (lo, hi) = (format!("{k}\\"), format!("{k}]"));
+            let doomed: Vec<Box<str>> = g.by_path.range::<str, _>((Bound::Included(lo.as_str()), Bound::Excluded(hi.as_str()))).map(|(k, _)| k.clone()).collect();
+            for d in doomed {
+                g.by_path.remove(&d);
+            }
+        }
         g.epoch += 1;
     }
 
@@ -149,6 +160,12 @@ impl Descriptors {
         g.by_path.clear();
         g.distinct.clear();
         g.epoch += 1;
+        self.cleared.store(true, Relaxed);
+    }
+
+    /// Whether `clear` ran since the last call.
+    pub fn take_cleared(&self) -> bool {
+        self.cleared.swap(false, Relaxed)
     }
 
     pub fn folders(&self) -> usize {
@@ -251,7 +268,9 @@ mod tests {
         cache.get(&base.join("open").join("sub").to_string_lossy()).unwrap();
         assert_eq!(cache.folders(), 4);
         cache.forget_trees(&[base.join("open").to_string_lossy().to_uppercase()]);
+        // `open2` sorts right next to `open\...` and must survive.
         assert_eq!(cache.folders(), 2);
+        assert!(cache.get(&base.join("open2").to_string_lossy()).is_some());
         cache.forget(&base.join("open2").to_string_lossy());
         assert_eq!(cache.folders(), 1);
         cache.clear();
