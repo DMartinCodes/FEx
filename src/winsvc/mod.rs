@@ -18,7 +18,7 @@
 mod access;
 mod profile;
 pub mod proto;
-mod scm;
+pub(crate) mod scm;
 mod server;
 mod throttle;
 mod usn;
@@ -44,7 +44,7 @@ fn config() -> server::Config {
 
 /// Release builds have no console of their own: print to the one we were
 /// started from.
-fn attach_console() {
+pub(crate) fn attach_console() {
     use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
@@ -107,6 +107,7 @@ pub fn cli(args: &[String]) -> i32 {
         Some("status") => match proto::status() {
             Ok(st) => {
                 let age = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |n| n.as_secs().saturating_sub(st.verified_ns / 1_000_000_000));
+                println!("service:   FEx {}", if st.version.is_empty() { "?" } else { &st.version });
                 println!("drives:    {} (ready: {})", st.roots.join(" "), st.ready.join(" "));
                 println!("index:     {} entries", st.entries);
                 println!("verified:  {age} s ago");

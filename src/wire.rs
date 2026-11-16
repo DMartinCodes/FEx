@@ -5,6 +5,22 @@
 
 use std::io::{self, Read, Write};
 
+/// First byte of every request to the index daemon or service. It changes
+/// whenever a request or reply changes shape, so an app and a service of
+/// different FEx versions (one updated, the other still running) report
+/// the mismatch instead of misreading each other. High bit set: no request
+/// op code ever looked like this.
+pub const PROTOCOL: u8 = 0x81;
+
+/// What a service answers a request of another protocol.
+pub fn protocol_mismatch(got: Option<u8>) -> String {
+    format!(
+        "this FEx and the index service are different versions (protocol {} here, {PROTOCOL:#x} in the service, FEx {}); restart FEx",
+        got.map_or("none".to_string(), |g| format!("{g:#x}")),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 pub fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }

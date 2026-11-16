@@ -12,7 +12,7 @@ mod fanotify;
 mod fsys;
 mod index;
 mod profile;
-mod proto;
+pub(crate) mod proto;
 mod snapshot;
 mod sys;
 mod throttle;
@@ -32,6 +32,7 @@ const USAGE: &str = "usage: fex [folder]
        fex query [--regex] [--scope DIR] [--limit N] [--show N] <text>
        fex status
        fex profile [--root /] [--state-dir /var/lib/fex] [--save]
+       fex update [check]   (signed updates from GitHub releases)
        fex --bench <folder> [--runs N] [query ...]
            query: keywords (globs with * ?, type:ext), or re:<regex>
        fex --bench-interference <folder> [--secs N]
@@ -85,6 +86,7 @@ pub fn main() -> ExitCode {
         Some("query") => cli_query(&args[1..]),
         Some("status") => cli_status(),
         Some("profile") => cli_profile(&args[1..]),
+        Some("update") => ExitCode::from(crate::update::cli(&args[1..]).clamp(0, 255) as u8),
         _ => gui(args.into_iter().next()),
     }
 }
@@ -386,6 +388,7 @@ fn cli_status() -> ExitCode {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|n| n.as_secs().saturating_sub(st.verified_ns / 1_000_000_000))
                 .unwrap_or(0);
+            println!("daemon:    FEx {}", if st.version.is_empty() { "?" } else { &st.version });
             println!("root:      {}", String::from_utf8_lossy(&st.root));
             println!("index:     {}", if st.ready { format!("{} entries, {} folders (generation {})", st.entries, st.dirs, st.generation) } else { "being built".into() });
             println!("index data: {:.1} MB mapped snapshot + {:.1} MB heap", st.mapped_bytes as f64 / 1048576.0, st.heap_bytes as f64 / 1048576.0);

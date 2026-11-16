@@ -1356,6 +1356,20 @@ mod tests {
         let _ = fs::remove_dir_all(store);
     }
 
+    /// Indexes saved by released versions must keep loading: an update that
+    /// couldn't read them would re-crawl every drive. To change the format,
+    /// keep reading the old one, change `MAGIC`, and add a fixture.
+    #[test]
+    fn loads_released_index_formats() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join("formats");
+        let current = dir.join(format!("windows-index-{}.idx", std::str::from_utf8(MAGIC).unwrap()));
+        assert!(current.exists(), "no fixture for the current index format: add {}", current.display());
+        let idx = Index::load(&dir.join("windows-index-FEXIDX02.idx")).expect("format FEXIDX02 no longer loads");
+        assert_eq!(&*idx.root, "C:\\Fixture");
+        assert_eq!(idx.entries, 3);
+        assert_eq!(names(&idx, "txt"), ["a.txt", "b.txt"]);
+    }
+
     /// What saving relies on: once the watcher reports settled, every change
     /// it received is in the index.
     #[test]

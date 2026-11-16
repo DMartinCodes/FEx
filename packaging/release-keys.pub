@@ -1,0 +1,9 @@
+# Public keys that sign FEx releases (minisign). Builds trust these, and
+# only these, to install updates. One base64 key per line; lines starting
+# with '#' are comments.
+#
+# To rotate: add the new key here, ship a release signed with the old key
+# (so installed copies learn the new one), then sign with the new key and
+# remove the old line in a later release.
+#
+# No key yet: until one is added, builds refuse to install updates.

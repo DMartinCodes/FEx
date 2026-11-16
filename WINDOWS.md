@@ -16,12 +16,14 @@ service's pipe and otherwise searches exactly as before.
 From an elevated prompt:
 
 ```bat
-fex service install      & rem install as FExIndex (LocalSystem, delayed auto start) and start
+fex service install      & rem copy to %ProgramFiles%\FEx, install that as FExIndex (LocalSystem, delayed auto start), start
 fex service status       & rem drives, entries, activity, CPU reserve, memory
 fex service query report & rem search through the service from the current folder
 fex service profile      & rem the machine profile and CPU reserve
 fex service log          & rem the end of the service's log
 fex service uninstall    & rem stop and remove
+fex update check         & rem is a newer release out?
+fex update               & rem download, verify and install it (restarts the service, keeps its index)
 fex service debug        & rem run in the console instead (Ctrl+C ends it unsaved)
 ```
 
@@ -32,6 +34,12 @@ everyone (timings and drive roots, no file names); `fex service log` shows
 its end. Set `FEX_RESERVE` (percent) on the service to override the CPU
 reserve, and `FEX_MEMORY_FLOOR` (percent, default 10) to change when it
 starts giving memory back.
+
+The service always runs the copy in `%ProgramFiles%\FEx`, which only
+administrators can change, never the file `install` was started from. The
+app offers new releases in its status bar: they're verified signed
+releases, installed after a UAC prompt, and the service keeps its index.
+See DEPLOY.md.
 
 ## How it works
 

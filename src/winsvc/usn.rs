@@ -275,6 +275,15 @@ pub fn load(path: &Path) -> Option<Position> {
 mod tests {
     use super::*;
 
+    /// Journal positions saved by released versions must keep loading (or
+    /// the service re-crawls instead of catching up).
+    #[test]
+    fn loads_released_position_format() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join("formats").join("windows-usn-position.usn");
+        let pos = load(&p).expect("the saved journal position no longer loads");
+        assert_eq!((pos.journal, pos.next), (133456789012, 987654321));
+    }
+
     /// Runs where the journal is readable (an administrator on NTFS, as on
     /// CI runners); elsewhere it reports and passes.
     #[test]

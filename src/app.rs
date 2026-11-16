@@ -221,6 +221,8 @@ pub struct FexApp {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     ctx: egui::Context,
+    /// Signed updates from GitHub releases (checked at start, then daily).
+    updater: crate::update::Updater,
 
     cwd: String,
     path_text: String,
@@ -342,6 +344,10 @@ impl FexApp {
         let start = start.or_else(|| tabs.get(session.active).cloned());
         let mut app = Self::with_context(cc.egui_ctx.clone(), start);
         app.apply_session(session, tabs);
+        app.updater = {
+            let ctx = cc.egui_ctx.clone();
+            crate::update::Updater::start(move || ctx.request_repaint())
+        };
         let hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
             RawWindowHandle::Win32(w) => Some(w.hwnd.get() as HWND),
             _ => None,
@@ -372,6 +378,7 @@ impl FexApp {
             })
             .unwrap_or_else(|| RECENT.to_string());
         let mut app = FexApp {
+            updater: crate::update::Updater::default(),
             tx,
             rx,
             ctx,
@@ -2588,6 +2595,7 @@ impl FexApp {
 
             // Search details stay out of the way: one short word, the rest on hover.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                crate::update::status_widget(ui, &self.updater);
                 if let Some(s) = self.service.as_ref().filter(|s| !self.service_failed && s.covers(&self.cwd)) {
                     let paused = if s.paused.is_empty() { String::new() } else { format!(" (paused: {})", s.paused) };
                     ui.weak("Index service").on_hover_text(format!("{} entries · {}{paused}\n{}", s.entries, s.activity, s.reserve));

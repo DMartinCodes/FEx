@@ -56,6 +56,14 @@ sudo install -m644 packaging/linux/fex-indexd.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now fex-indexd
 ```
 
+Updates: the app offers new releases in its status bar (pkexec asks for
+the password), or run `sudo fex update` (`fex update check` only looks).
+Releases are signed and verified before they install. The binary is
+swapped atomically, and the daemon restarts with its saved index, rolling
+back if it doesn't answer. Only a root-owned, root-only-writable install
+(as above) installs updates. Release binaries need glibc 2.28 or later
+(Rocky/RHEL 8+, Ubuntu 20.04+). See DEPLOY.md.
+
 **Lifecycle.** On start it memory-maps its last snapshot
 (`/var/lib/fex/index.snap`, mode 0600) and answers at once, then verifies
 it: one `statx` per folder, comparing ctimes, re-reading only folders that

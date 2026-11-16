@@ -182,6 +182,8 @@ enum Action {
 
 pub struct App {
     ctx: egui::Context,
+    /// Signed updates from GitHub releases (checked at start, then daily).
+    updater: crate::update::Updater,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 
@@ -250,7 +252,12 @@ impl App {
                 (format!("{label}  ({})", m.fstype), m.point)
             })
             .collect();
+        let updater = {
+            let ctx = cc.egui_ctx.clone();
+            crate::update::Updater::start(move || ctx.request_repaint())
+        };
         let mut app = App {
+            updater,
             ctx: cc.egui_ctx.clone(),
             tx,
             rx,
@@ -1095,6 +1102,7 @@ impl App {
                 ui.label(format!("{} items{hidden}{sel} · listed in {:.1} ms", self.view.len(), self.listed_in.as_secs_f64() * 1e3));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::update::status_widget(ui, &self.updater);
                 ui.weak("X11 prototype");
                 if let (true, Some(d)) = (self.daemon_covers(&self.cwd), &self.daemon) {
                     let age = std::time::SystemTime::now()

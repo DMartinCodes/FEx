@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicPtr, Ordering::Relaxed};
 
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Services::{
-    ChangeServiceConfig2W, CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, RegisterServiceCtrlHandlerExW,
+    ChangeServiceConfigW, QueryServiceConfigW, QueryServiceStatus, QUERY_SERVICE_CONFIGW, SERVICE_NO_CHANGE, SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, ChangeServiceConfig2W, CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, RegisterServiceCtrlHandlerExW,
     SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
     SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_INTERROGATE,
     SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DELAYED_AUTO_START_INFO, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_RUNNING,
@@ -106,8 +107,11 @@ fn manager() -> Result<Handle, String> {
 
 /// Install as an automatic (delayed start) service running as LocalSystem,
 /// and start it.
+/// The service runs a copy in `%ProgramFiles%\FEx` (made here), never the
+/// file install was run from: a SYSTEM service must not run a binary that
+/// a standard user could replace (Downloads, the desktop, ...).
 pub fn install() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::update::install_copy()?;
     let command = format!("\"{}\" service run", exe.display());
     let scm = manager()?;
     let (name, display, cmd) = (wide(NAME), wide(DISPLAY), wide(&command));
@@ -160,6 +164,90 @@ pub fn uninstall() -> Result<(), String> {
         if DeleteService(svc.0) == 0 {
             return Err(format!("cannot remove the service: {}", std::io::Error::last_os_error()));
         }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------ for updates
+
+/// The installed service: its command line and whether it's running.
+pub struct Installed {
+    pub command: String,
+    pub running: bool,
+}
+
+fn open(access: u32) -> Result<Option<Handle>, String> {
+    let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if scm.is_null() {
+        return Err(format!("cannot open the service manager: {}", std::io::Error::last_os_error()));
+    }
+    let scm = Handle(scm);
+    let name = wide(NAME);
+    let svc = unsafe { OpenServiceW(scm.0, name.as_ptr(), access) };
+    Ok((!svc.is_null()).then_some(Handle(svc)))
+}
+
+fn state(svc: &Handle) -> Option<SERVICE_STATUS_CURRENT_STATE> {
+    let mut st: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    (unsafe { QueryServiceStatus(svc.0, &mut st) } != 0).then_some(st.dwCurrentState)
+}
+
+/// A NUL-terminated UTF-16 string.
+unsafe fn from_wide_ptr(p: *const u16) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let len = (0..).take_while(|&i| unsafe { *p.add(i) } != 0).count();
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
+}
+
+/// The installed service, if any.
+pub fn installed() -> Result<Option<Installed>, String> {
+    let Some(svc) = open(SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)? else { return Ok(None) };
+    let mut need = 0u32;
+    unsafe { QueryServiceConfigW(svc.0, std::ptr::null_mut(), 0, &mut need) };
+    let mut buf = vec![0u64; (need as usize).div_ceil(8).max(1)];
+    if unsafe { QueryServiceConfigW(svc.0, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut need) } == 0 {
+        return Err(format!("cannot read the service's configuration: {}", std::io::Error::last_os_error()));
+    }
+    let cfg = unsafe { &*buf.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
+    let command = unsafe { from_wide_ptr(cfg.lpBinaryPathName) };
+    let running = !matches!(state(&svc), Some(SERVICE_STOPPED) | None);
+    Ok(Some(Installed { command, running }))
+}
+
+/// Stop the service and wait (it saves its indexes as it stops).
+pub fn stop_and_wait(limit: std::time::Duration) -> Result<(), String> {
+    let Some(svc) = open(SERVICE_ALL_ACCESS)? else { return Ok(()) };
+    let mut st: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    unsafe { ControlService(svc.0, SERVICE_CONTROL_STOP, &mut st) };
+    let t = std::time::Instant::now();
+    while t.elapsed() < limit {
+        if matches!(state(&svc), Some(SERVICE_STOPPED)) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Err("the index service didn't stop in time".into())
+}
+
+pub fn start() -> Result<(), String> {
+    let Some(svc) = open(SERVICE_ALL_ACCESS)? else { return Err("the index service isn't installed".into()) };
+    if unsafe { StartServiceW(svc.0, 0, std::ptr::null()) } == 0 {
+        return Err(format!("cannot start the index service: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Point the service at another command line.
+pub fn set_command(command: &str) -> Result<(), String> {
+    let Some(svc) = open(SERVICE_ALL_ACCESS)? else { return Err("the index service isn't installed".into()) };
+    let cmd = wide(command);
+    let ok = unsafe {
+        ChangeServiceConfigW(svc.0, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, cmd.as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null())
+    };
+    if ok == 0 {
+        return Err(format!("cannot change the service's command: {}", std::io::Error::last_os_error()));
     }
     Ok(())
 }

@@ -5,7 +5,8 @@
 //! stores size, date and attributes with every name).
 //!
 //! ```text
-//! request:  op u8 = QUERY, regex u8, limit u32, scope bytes, query bytes,
+//! request:  protocol u8 (`wire::PROTOCOL`), then
+//!           op u8 = QUERY, regex u8, limit u32, scope bytes, query bytes,
 //!           order u8 (NAME_ASC / NAME_DESC / UNORDERED), first u32,
 //!           seq u64 (the client's query number: a higher one from the same
 //!           process supersedes this query; 0 = never superseded)
@@ -148,7 +149,7 @@ impl Stream {
 /// Ask the service for matches under `scope`. `Err` when it isn't running.
 pub fn query(scope: &str, text: &str, regex: bool, limit: u32, order: u8, first: u32, seq: u64) -> io::Result<Reply> {
     let mut p = connect()?;
-    let mut req = vec![QUERY, regex as u8];
+    let mut req = vec![wire::PROTOCOL, QUERY, regex as u8];
     put_u32(&mut req, limit.min(MAX_LIMIT));
     put_bytes(&mut req, scope.as_bytes());
     put_bytes(&mut req, text.as_bytes());
@@ -186,6 +187,8 @@ pub struct Status {
     pub reserve: String,
     /// Memory use and the memory level right now.
     pub memory: String,
+    /// The service's FEx version.
+    pub version: String,
 }
 
 impl Status {
@@ -200,7 +203,7 @@ pub fn encode_status(st: &Status) -> Vec<u8> {
     put_bytes(&mut out, st.ready.join("\n").as_bytes());
     put_u64(&mut out, st.entries);
     put_u64(&mut out, st.verified_ns);
-    for s in [&st.activity, &st.paused, &st.reserve, &st.memory] {
+    for s in [&st.activity, &st.paused, &st.reserve, &st.memory, &st.version] {
         put_bytes(&mut out, s.as_bytes());
     }
     out
@@ -208,7 +211,7 @@ pub fn encode_status(st: &Status) -> Vec<u8> {
 
 pub fn status() -> io::Result<Status> {
     let mut p = connect()?;
-    wire::send(&mut p, &[STATUS])?;
+    wire::send(&mut p, &[wire::PROTOCOL, STATUS])?;
     let body = wire::recv(&mut p, MAX_REQUEST)?;
     let mut r = Reader::new(&body);
     if r.u8()? != OK {
@@ -225,5 +228,6 @@ pub fn status() -> io::Result<Status> {
         paused: text(r.bytes()?),
         reserve: text(r.bytes()?),
         memory: r.bytes().map(text).unwrap_or_default(),
+        version: r.bytes().map(text).unwrap_or_default(),
     })
 }

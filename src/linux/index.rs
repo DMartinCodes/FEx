@@ -1030,6 +1030,40 @@ mod tests {
         (root, r)
     }
 
+    const FIXTURE_ROOT: &str = "/tmp/fex-format-fixture";
+
+    fn fixture_path(version: u32) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("testdata/formats/linux-snapshot-v{version}.snap"))
+    }
+
+    /// Snapshots written by released versions must keep loading: an update
+    /// that couldn't read the last snapshot would re-crawl every machine.
+    /// To change the format, keep reading the old one, bump
+    /// `snapshot::VERSION` and add a fixture with `write_format_fixture`.
+    #[test]
+    fn loads_released_snapshot_formats() {
+        assert!(fixture_path(snapshot::VERSION).exists(), "no fixture for snapshot format {}: run `cargo test write_format_fixture -- --ignored`", snapshot::VERSION);
+        for version in 1..=snapshot::VERSION {
+            let index = Index::load(&fixture_path(version)).unwrap_or_else(|e| panic!("snapshot format {version} no longer loads: {e}"));
+            assert_eq!(&*index.root, FIXTURE_ROOT.as_bytes());
+            assert_eq!((index.entries, index.dirs), (4, 3));
+            assert_eq!(names(&index, "report", false, &index.root), [b"Report.TXT".to_vec(), b"report.txt".to_vec()]);
+        }
+    }
+
+    #[test]
+    #[ignore = "writes the fixture for the current snapshot format"]
+    fn write_format_fixture() {
+        let root = Path::new(FIXTURE_ROOT);
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root.join("Foo/deep")).unwrap();
+        fs::write(root.join("Foo/deep/Report.TXT"), b"1").unwrap();
+        fs::write(root.join("report.txt"), b"22").unwrap();
+        let index = Build::new(FIXTURE_ROOT.as_bytes(), false).run().unwrap();
+        index.save(&fixture_path(snapshot::VERSION)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn finds_exact_names_in_case_sensitive_trees() {
         let (root, r) = scratch("names");

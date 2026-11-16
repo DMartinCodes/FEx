@@ -883,6 +883,10 @@ fn serve(sh: &Shared, pipe: &File) {
         let _ = wire::send(w, &out);
     };
     let mut r = Reader::new(&req);
+    let protocol = r.u8().ok();
+    if protocol != Some(wire::PROTOCOL) {
+        return reply(&mut w, proto::ERROR, &wire::protocol_mismatch(protocol));
+    }
     match r.u8() {
         Ok(proto::QUERY) => {
             let parsed = (|| Ok::<_, std::io::Error>((r.u8()? != 0, r.u32()?, String::from_utf8_lossy(r.bytes()?).into_owned(), String::from_utf8_lossy(r.bytes()?).into_owned())))();
@@ -947,6 +951,7 @@ fn serve(sh: &Shared, pipe: &File) {
                 paused: sh.throttle.paused().unwrap_or_default(),
                 reserve: sh.throttle.reserve_state(),
                 memory: memory_state(sh),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 ..Default::default()
             };
             for d in &sh.drives {

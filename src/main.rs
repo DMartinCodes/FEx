@@ -39,6 +39,7 @@ mod session;
 #[cfg(windows)]
 mod shellnew;
 mod typeahead;
+mod update;
 #[cfg(windows)]
 mod walk;
 #[cfg(windows)]
@@ -175,6 +176,12 @@ fn main() -> eframe::Result {
         install_dump_writer();
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(winsvc::cli(&args));
+    }
+    // `fex update ...`: signed updates from GitHub releases.
+    if std::env::args().nth(1).as_deref() == Some("update") {
+        winsvc::attach_console();
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(update::cli(&args));
     }
     install_crash_reporter();
     install_dump_writer();

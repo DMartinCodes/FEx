@@ -754,6 +754,10 @@ fn serve(sh: &Shared, mut s: UnixStream) {
     }
     let Ok(req) = proto::recv(&mut s, proto::MAX_REQUEST) else { return };
     let mut r = Reader::new(&req);
+    let protocol = r.u8().ok();
+    if protocol != Some(crate::wire::PROTOCOL) {
+        return reply(&mut s, proto::ERROR, crate::wire::protocol_mismatch(protocol).as_bytes());
+    }
     match r.u8() {
         Ok(proto::QUERY) => {
             let parsed = (|| Ok::<_, std::io::Error>((r.u8()? != 0, r.u32()?, r.bytes()?.to_vec(), String::from_utf8_lossy(r.bytes()?).into_owned())))();
@@ -864,6 +868,7 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 paused: sh.throttle.paused().unwrap_or_default(),
                 reserve: sh.throttle.reserve_state(),
                 memory: memory_state(sh),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 ..Default::default()
             };
             if let Some(i) = g.as_ref() {

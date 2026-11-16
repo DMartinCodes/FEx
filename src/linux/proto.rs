@@ -3,7 +3,8 @@
 //! u32 length followed by the bytes (paths are bytes, never decoded).
 //!
 //! ```text
-//! request:  op u8 = QUERY, regex u8, limit u32, scope bytes, query bytes,
+//! request:  protocol u8 (`wire::PROTOCOL`), then
+//!           op u8 = QUERY, regex u8, limit u32, scope bytes, query bytes,
 //!           order u8 (NAME_ASC / NAME_DESC / UNORDERED), first u32,
 //!           seq u64 (the client's query number: a higher one from the same
 //!           process supersedes this query; 0 = never superseded)
@@ -134,7 +135,7 @@ fn connect() -> io::Result<UnixStream> {
 /// the `first` rows that come first in `order`. `Err` when there is no daemon.
 pub fn query(scope: &[u8], text: &str, regex: bool, limit: u32, order: u8, first: u32, seq: u64) -> io::Result<Reply> {
     let mut s = connect()?;
-    let mut req = vec![QUERY, regex as u8];
+    let mut req = vec![crate::wire::PROTOCOL, QUERY, regex as u8];
     put_u32(&mut req, limit.min(MAX_LIMIT));
     put_bytes(&mut req, scope);
     put_bytes(&mut req, text.as_bytes());
@@ -178,6 +179,8 @@ pub struct Status {
     pub reserve: String,
     /// Memory use and the memory level right now.
     pub memory: String,
+    /// The daemon's FEx version.
+    pub version: String,
 }
 
 pub fn encode_status(st: &Status) -> Vec<u8> {
@@ -192,12 +195,13 @@ pub fn encode_status(st: &Status) -> Vec<u8> {
     put_bytes(&mut out, st.paused.as_bytes());
     put_bytes(&mut out, st.reserve.as_bytes());
     put_bytes(&mut out, st.memory.as_bytes());
+    put_bytes(&mut out, st.version.as_bytes());
     out
 }
 
 pub fn status() -> io::Result<Status> {
     let mut s = connect()?;
-    send(&mut s, &[STATUS])?;
+    send(&mut s, &[crate::wire::PROTOCOL, STATUS])?;
     let body = recv(&mut s, MAX_REQUEST)?;
     let mut r = Reader::new(&body);
     if r.u8()? != OK {
@@ -217,5 +221,6 @@ pub fn status() -> io::Result<Status> {
         paused: String::from_utf8_lossy(r.bytes()?).into_owned(),
         reserve: r.bytes().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default(),
         memory: r.bytes().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default(),
+        version: r.bytes().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default(),
     })
 }

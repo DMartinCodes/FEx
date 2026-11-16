@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"FEXSNAP1";
-const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 1;
 const ENDIAN: u32 = 0x0A0B_0C0D;
 const HEADER: usize = 64;
 pub const SECTIONS: usize = 10;
