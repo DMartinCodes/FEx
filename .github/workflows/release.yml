@@ -1,0 +1,126 @@
+# Release builds. Pushing a tag `vX.Y.Z` (matching Cargo.toml's version)
+# builds, tests and packages both platforms and publishes a GitHub release.
+# Run it by hand (workflow_dispatch) for a dry run: the same builds and
+# packages, uploaded as an artifact, with no release.
+#
+# Linux builds on Rocky Linux 8 so the binary needs only glibc 2.28: it runs
+# on Rocky/RHEL 8 and 9, Ubuntu 20.04 and later, Debian 11 and later.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Version from Cargo.toml (must match the tag)
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"\r\?$/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version $version"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ needs.version.outputs.version }}"
+          New-Item -ItemType Directory dist, stage | Out-Null
+          Copy-Item target/release/fex.exe dist/fex-windows-x64.exe
+          Copy-Item target/release/fex.exe, WINDOWS.md stage/
+          Compress-Archive -Path stage/* -DestinationPath "dist/fex-$v-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist/
+          if-no-files-found: error
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    container: rockylinux:8
+    steps:
+      - name: Build tools
+        run: dnf install -y --setopt=install_weak_deps=False gcc git tar gzip binutils
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked
+      - name: glibc floor is 2.28
+        run: |
+          newest=$(objdump -T target/release/fex | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "newest glibc symbol: $newest"
+          [ "$(printf '%s\n2.28\n' "$newest" | sort -V | tail -1)" = 2.28 ] || { echo "::error::needs glibc $newest"; exit 1; }
+      - name: Test
+        run: cargo test --locked
+      - name: Package
+        run: |
+          v="${{ needs.version.outputs.version }}"
+          mkdir -p dist "stage/fex-$v"
+          cp target/release/fex dist/fex-linux-x64
+          cp target/release/fex LINUX.md packaging/linux/fex-indexd.service "stage/fex-$v/"
+          tar -C stage -czf "dist/fex-$v-linux-x64.tar.gz" "fex-$v"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [version, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: "Dry run (no tag): keep the packages as an artifact"
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run-${{ needs.version.outputs.version }}
+          path: dist/
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "FEx ${{ needs.version.outputs.version }}" --generate-notes --verify-tag

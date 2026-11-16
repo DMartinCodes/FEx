@@ -48,7 +48,8 @@ fn set_step(step: usize) {
             libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0 as libc::c_long, IOPRIO_CLASS_IDLE << 13);
         } else {
             libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
-            libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, NICE_STEPS[step - 1]);
+            // The raw syscall: the gettid() wrapper needs glibc 2.30 (releases build against 2.28).
+            libc::setpriority(libc::PRIO_PROCESS, libc::syscall(libc::SYS_gettid) as libc::id_t, NICE_STEPS[step - 1]);
             libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0 as libc::c_long, (IOPRIO_CLASS_BE << 13) | 7);
         }
     }
