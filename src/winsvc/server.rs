@@ -241,6 +241,8 @@ pub fn run(cfg: Config, ready: impl FnOnce()) {
         thread::Builder::new().name("fex-maintain".into()).spawn(move || maintain(&sh, save_every, user_reserve)).ok()
     };
     serve_pipe(&sh, ready);
+    // Background threads paused on battery must still see the stop.
+    sh.throttle.stop();
     if let Some(m) = maint {
         let _ = m.join();
     }
@@ -309,14 +311,40 @@ fn save_drive(sh: &Shared, d: &Drive, only_dirty: bool) {
     if only_dirty && !index::read(&live.index).dirty {
         return;
     }
-    // The position is taken first, then the watcher gets a moment to apply
-    // what came before it: replaying a little twice is harmless, missing
-    // a change isn't.
+    // The saved position must not run ahead of the index: take it first,
+    // let the watcher receive everything logged before it (it reads every
+    // 500 ms), then wait until it has applied all of it. Replaying a little
+    // twice at the next start is harmless; skipping a change isn't.
     let pos = usn::position(&d.root);
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_millis(1500));
+    let stopping = STOP.load(Relaxed);
+    let deadline = Instant::now() + if stopping { Duration::from_secs(10) } else { Duration::from_secs(60) };
+    let mut settled = live.settled();
+    while !settled && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+        settled = live.settled();
+    }
     let (idx_path, pos_path) = saved_paths(&sh.dir, &d.root);
+    let pos = match (settled, stopping) {
+        (true, _) => pos,
+        // Still busy: try again next round.
+        (false, false) => {
+            log(&format!("{}: still applying changes; saving later", d.root));
+            *d.last_save.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+            return;
+        }
+        // Stopping while busy: save the index (it answers at once next
+        // time) but not the position, so the next start crawls to be sure.
+        (false, true) => {
+            log(&format!("{}: saved while still applying changes; it will be crawled at the next start", d.root));
+            None
+        }
+    };
     index::write(&live.index).dirty = false;
-    let saved = index::read(&live.index).save_to(&sh.dir);
+    // Serialized under the read lock (memory only); written and synced after.
+    let bytes = index::read(&live.index).serialize();
+    let saved = Index::write_saved(&sh.dir, &live.root, &bytes);
+    drop(bytes);
     match saved {
         Ok(_) => {
             match pos {
@@ -740,6 +768,7 @@ fn serve(sh: &Shared, pipe: &File) {
             let Ok((regex, limit, scope, text)) = parsed else { return reply(&mut w, proto::ERROR, "malformed request") };
             let order = r.u8().unwrap_or(proto::NAME_ASC);
             let first = r.u32().unwrap_or(u32::MAX) as usize;
+            let seq = r.u64().unwrap_or(0);
             if text.len() > 4096 {
                 return reply(&mut w, proto::ERROR, "queries are limited to 4096 bytes");
             }
@@ -757,9 +786,11 @@ fn serve(sh: &Shared, pipe: &File) {
             };
             let Some(token) = client_token(pipe) else { return reply(&mut w, proto::ERROR, "could not identify the client") };
             let limit = limit.min(proto::MAX_LIMIT) as usize;
-            // A newer query from the same process makes this one obsolete.
             let mut pid = 0u32;
             unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) };
+            // Search as you type: a newer query from the same client (by the
+            // client's own numbering, not arrival order) makes this one
+            // obsolete. 0 means unnumbered: never superseded.
             let latest = {
                 let mut clients = sh.clients.lock().unwrap_or_else(PoisonError::into_inner);
                 if clients.len() > 256 {
@@ -767,8 +798,10 @@ fn serve(sh: &Shared, pipe: &File) {
                 }
                 clients.entry(pid).or_default().clone()
             };
-            let mine = latest.fetch_add(1, Relaxed) + 1;
-            let cancelled = || latest.load(Relaxed) != mine;
+            if seq != 0 {
+                latest.fetch_max(seq, Relaxed);
+            }
+            let cancelled = || seq != 0 && latest.load(Relaxed) > seq;
             let found = {
                 let idx = index::read(&live.index);
                 if is_system(&token) {

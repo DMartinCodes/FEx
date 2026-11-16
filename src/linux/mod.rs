@@ -332,7 +332,7 @@ fn cli_query(args: &[String]) -> ExitCode {
     let cwd = std::env::current_dir().map(|d| d.as_os_str().as_bytes().to_vec()).unwrap_or_else(|_| b"/".to_vec());
     let scope = scope.map_or(b"/".to_vec(), |s| fsys::resolve_input(&s, &cwd));
     let t = Instant::now();
-    match proto::query(&scope, &words.join(" "), regex, limit, proto::NAME_ASC, SCREENFUL) {
+    match proto::query(&scope, &words.join(" "), regex, limit, proto::NAME_ASC, SCREENFUL, 0) {
         Err(e) => {
             eprintln!("no index daemon at {}: {e}", proto::socket_path().display());
             ExitCode::FAILURE

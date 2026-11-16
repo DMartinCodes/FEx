@@ -120,7 +120,7 @@ pub fn cli(args: &[String]) -> i32 {
             let text = args[1..].join(" ");
             let scope = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| r"C:\".into());
             let t = Instant::now();
-            match proto::query(&scope, &text, false, proto::MAX_LIMIT, proto::NAME_ASC, 200) {
+            match proto::query(&scope, &text, false, proto::MAX_LIMIT, proto::NAME_ASC, 200, 0) {
                 Ok(proto::Reply::Rows { mut rows, total, mut rest }) => {
                     let first = t.elapsed();
                     let shown: Vec<String> = rows.iter().take(20).map(|r| r.full_path(&scope)).collect();

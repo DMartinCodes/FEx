@@ -113,6 +113,8 @@ fn on_battery() -> bool {
 
 pub struct Throttle {
     paused: AtomicBool,
+    /// Shutting down: nothing waits for a pause to end any more.
+    stopping: AtomicBool,
     reason: Mutex<String>,
     /// Pause when others' I/O stall share (PSI some avg10) exceeds this.
     io_limit: f64,
@@ -132,22 +134,28 @@ pub struct Throttle {
 }
 
 impl Throttle {
-    /// Start watching pressure and power every half second, and enforce
-    /// `reserve` (a share of total CPU capacity across `cores`) every 100 ms.
-    pub fn start(io_limit: f64, reserve: f64, cores: usize) -> Arc<Throttle> {
-        let cgroup = own_cgroup();
-        let t = Arc::new(Throttle {
+    /// The state alone, with no monitor threads (`start` adds them).
+    fn new(io_limit: f64, reserve: f64, cores: usize, own_cgroup: bool) -> Throttle {
+        Throttle {
             paused: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             reason: Mutex::new(String::new()),
             io_limit,
-            own_cgroup: cgroup.is_some(),
+            own_cgroup,
             reserve: AtomicU64::new(reserve.to_bits()),
             cores: cores.max(1),
             used_ns: AtomicU64::new(0),
             last_pace: AtomicU64::new(0),
             step: AtomicUsize::new(0),
             share_ppm: AtomicU64::new(0),
-        });
+        }
+    }
+
+    /// Start watching pressure and power every half second, and enforce
+    /// `reserve` (a share of total CPU capacity across `cores`) every 100 ms.
+    pub fn start(io_limit: f64, reserve: f64, cores: usize) -> Arc<Throttle> {
+        let cgroup = own_cgroup();
+        let t = Arc::new(Throttle::new(io_limit, reserve, cores, cgroup.is_some()));
         let w = Arc::downgrade(&t);
         thread::Builder::new()
             .name("fex-reserve".into())
@@ -218,10 +226,16 @@ impl Throttle {
         if STEP.with(|s| s.replace(step)) != step {
             set_step(step);
         }
-        while self.paused.load(Relaxed) {
+        while self.paused.load(Relaxed) && !self.stopping.load(Relaxed) {
             thread::sleep(Duration::from_millis(250));
             LAST_CPU.with(|c| c.set(thread_cpu_ns()));
         }
+    }
+
+    /// Release paused threads for good, so they reach their cancel checks
+    /// (called when the service stops).
+    pub fn stop(&self) {
+        self.stopping.store(true, Relaxed);
     }
 
     pub fn reserve(&self) -> f64 {
@@ -250,6 +264,23 @@ impl Throttle {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_releases_paused_threads() {
+        let t = Arc::new(Throttle::new(10.0, 0.0, 1, false));
+        t.paused.store(true, Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t2 = t.clone();
+        thread::spawn(move || {
+            t2.wait();
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(600)).is_err(), "a paused wait must block");
+        t.stop();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).is_ok(), "stop must release it");
+    }
+
     #[test]
     fn parses_psi() {
         let dir = std::env::temp_dir().join(format!("fex-psi-{}", std::process::id()));

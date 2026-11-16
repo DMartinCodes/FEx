@@ -74,6 +74,8 @@ fn on_battery() -> bool {
 
 pub struct Throttle {
     paused: AtomicBool,
+    /// Shutting down: nothing waits for a pause to end any more.
+    stopping: AtomicBool,
     reserve: AtomicU64,
     cores: usize,
     used_ns: AtomicU64,
@@ -84,9 +86,11 @@ pub struct Throttle {
 }
 
 impl Throttle {
-    pub fn start(reserve: f64, cores: usize) -> Arc<Throttle> {
-        let t = Arc::new(Throttle {
+    /// The state alone, with no monitor thread (`start` adds it).
+    fn new(reserve: f64, cores: usize) -> Throttle {
+        Throttle {
             paused: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             reserve: AtomicU64::new(reserve.to_bits()),
             cores: cores.max(1),
             used_ns: AtomicU64::new(0),
@@ -94,7 +98,11 @@ impl Throttle {
             step: AtomicUsize::new(0),
             share_ppm: AtomicU64::new(0),
             epoch: Instant::now(),
-        });
+        }
+    }
+
+    pub fn start(reserve: f64, cores: usize) -> Arc<Throttle> {
+        let t = Arc::new(Throttle::new(reserve, cores));
         let w = Arc::downgrade(&t);
         thread::Builder::new()
             .name("fex-reserve".into())
@@ -125,6 +133,12 @@ impl Throttle {
         self.epoch.elapsed().as_nanos() as u64
     }
 
+    /// Release paused threads for good, so they reach their cancel checks
+    /// (called when the service stops).
+    pub fn stop(&self) {
+        self.stopping.store(true, Relaxed);
+    }
+
     pub fn reserve(&self) -> f64 {
         f64::from_bits(self.reserve.load(Relaxed))
     }
@@ -147,7 +161,7 @@ impl Throttle {
         if was != step {
             set_step(was, step);
         }
-        while self.paused.load(Relaxed) {
+        while self.paused.load(Relaxed) && !self.stopping.load(Relaxed) {
             thread::sleep(Duration::from_millis(500));
             LAST_CPU.with(|c| c.set(thread_cpu_ns()));
         }
@@ -164,5 +178,25 @@ impl Throttle {
             0 => format!("background mode, {share:.2}% of CPU (reserve {:.2}%)", self.reserve() * 100.0),
             s => format!("raised to {} priority to keep the {:.2}% reserve ({share:.2}% now)", names[s - 1], self.reserve() * 100.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_releases_paused_threads() {
+        let t = Arc::new(Throttle::new(0.0, 1));
+        t.paused.store(true, Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t2 = t.clone();
+        thread::spawn(move || {
+            t2.wait();
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(800)).is_err(), "a paused wait must block");
+        t.stop();
+        assert!(rx.recv_timeout(Duration::from_secs(3)).is_ok(), "stop must release it");
     }
 }

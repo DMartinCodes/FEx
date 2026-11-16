@@ -652,28 +652,56 @@ impl Index {
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         {
             let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
-            w.write_all(MAGIC)?;
-            put_str(&mut w, &self.root)?;
-            w.write_all(&(self.build_time.as_millis() as u64).to_le_bytes())?;
-            w.write_all(&(self.errors as u64).to_le_bytes())?;
-            w.write_all(&(self.dirs.len() as u64).to_le_bytes())?;
-            for &(s, d) in self.dirs.values() {
-                let shard = &self.shards[s as usize];
-                let (a, b) = shard.ranges[d as usize];
-                put_str(&mut w, &shard.dirs[d as usize])?;
-                w.write_all(&((b - a) as u32).to_le_bytes())?;
-                for i in a..b {
-                    let m = shard.meta[i];
-                    put_str(&mut w, shard.name(i))?;
-                    w.write_all(&m.attrs.to_le_bytes())?;
-                    w.write_all(&m.size.to_le_bytes())?;
-                    w.write_all(&m.mtime.to_le_bytes())?;
-                }
-            }
+            self.write_listings(&mut w)?;
             w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         }
         fs::rename(&tmp, &path)?;
         Ok(path)
+    }
+
+    /// The saved form in memory, for writing with `write_saved` after the
+    /// index lock is released (the index service: disk I/O and fsync then
+    /// don't hold up updates or the queries queued behind them).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.entries * 40 + self.dirs.len() * 64);
+        self.write_listings(&mut out).expect("writing to memory");
+        out
+    }
+
+    /// Write `bytes` from `serialize` as the saved index of `root` in `dir`.
+    pub fn write_saved(dir: &Path, root: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        let path = file_for(dir, root);
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        Ok(path)
+    }
+
+    fn write_listings(&self, w: &mut impl Write) -> io::Result<()> {
+        w.write_all(MAGIC)?;
+        put_str(w, &self.root)?;
+        w.write_all(&(self.build_time.as_millis() as u64).to_le_bytes())?;
+        w.write_all(&(self.errors as u64).to_le_bytes())?;
+        w.write_all(&(self.dirs.len() as u64).to_le_bytes())?;
+        for &(s, d) in self.dirs.values() {
+            let shard = &self.shards[s as usize];
+            let (a, b) = shard.ranges[d as usize];
+            put_str(w, &shard.dirs[d as usize])?;
+            w.write_all(&((b - a) as u32).to_le_bytes())?;
+            for i in a..b {
+                let m = shard.meta[i];
+                put_str(w, shard.name(i))?;
+                w.write_all(&m.attrs.to_le_bytes())?;
+                w.write_all(&m.size.to_le_bytes())?;
+                w.write_all(&m.mtime.to_le_bytes())?;
+            }
+        }
+        Ok(())
     }
 
     /// Read a saved index. Anything malformed yields `None`, never a panic.
@@ -991,6 +1019,12 @@ impl Live {
     pub fn covers(&self, path: &str) -> bool {
         in_scope(path, &self.root)
     }
+
+    /// Whether the watcher has nothing queued and nothing being applied
+    /// (it applies each batch holding its lock); true without a watcher.
+    pub fn settled(&self) -> bool {
+        self._fresh.as_ref().is_none_or(|f| f.state.try_lock().is_ok_and(|p| p.backlog.is_empty()))
+    }
 }
 
 // ----------------------------------------------------------------- build
@@ -1300,6 +1334,53 @@ mod tests {
         let mut found: Vec<String> = index.query(&m, &index.root, MAX, &|| false).unwrap().0.into_iter().map(|r| r.name.to_string()).collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn serialized_save_loads_back() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("fex-serialize-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("one.txt"), b"1").unwrap();
+        fs::write(root.join("sub").join("two.txt"), b"22").unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let idx = Build::new(&r).run(&|_, _| {}).unwrap();
+        let store = root.with_extension("store");
+        let path = Index::write_saved(&store, &idx.root, &idx.serialize()).unwrap();
+        assert_eq!(path, Index::saved_path(&store, &r));
+        let back = Index::load(&path).unwrap();
+        assert_eq!(names(&back, "txt"), ["one.txt", "two.txt"]);
+        assert_eq!(back.entries, idx.entries);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(store);
+    }
+
+    /// What saving relies on: once the watcher reports settled, every change
+    /// it received is in the index.
+    #[test]
+    fn settled_means_changes_are_applied() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("fex-settled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let build = Build::new(&r);
+        let idx = build.run(&|_, _| {}).unwrap();
+        let live = Live::new(idx, build.take_freshener(), |_| {});
+        for i in 0..50 {
+            fs::write(root.join(format!("late{i}.txt")), b"x").unwrap();
+        }
+        // Give the watcher its read cycle, then wait for it to settle.
+        std::thread::sleep(Duration::from_millis(1500));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !live.settled() {
+            assert!(Instant::now() < deadline, "watcher never settled");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(names(&read(&live.index), "late").len(), 50);
+        drop(live);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

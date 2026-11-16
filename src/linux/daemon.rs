@@ -257,6 +257,8 @@ pub fn run(cfg: Config) -> ExitCode {
         }
     }
     log("stopping");
+    // Background threads paused for pressure or battery must still see STOP.
+    shared.throttle.stop();
     if let Some(m) = maint {
         let _ = m.join();
     }
@@ -297,27 +299,38 @@ fn sd_notify(msg: &str) {
 
 fn save(sh: &Shared, snap: &Path, remap: bool) {
     let t = Instant::now();
-    let guard = sh.index.read().unwrap_or_else(PoisonError::into_inner);
-    let Some(idx) = guard.as_ref() else { return };
-    if let Err(e) = idx.save(snap) {
+    // The image is built under the read lock; the disk write and fsync
+    // happen after it is released.
+    let (image, generation) = {
+        let guard = sh.index.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(idx) = guard.as_ref() else { return };
+        (idx.save_image(), idx.generation)
+    };
+    if let Err(e) = image.write(snap) {
         log(&format!("saving {}: {e}", snap.display()));
         return;
     }
-    let generation = idx.generation;
-    drop(guard);
+    drop(image);
     sh.dirty.store(false, Relaxed);
     let saved = t.elapsed();
     // Swapping in the mapped, compacted copy frees the heap copy. Only this
     // thread writes, so nothing changed since the save.
     if remap && let Ok(mut fresh) = Index::load(snap) {
         fresh.generation = generation + 1;
+        // Built here, outside any lock, so the next update needn't.
+        let map = fresh.build_map();
+        fresh.install_map(map);
         *sh.index.write().unwrap_or_else(PoisonError::into_inner) = Some(fresh);
     }
     log(&format!("saved snapshot in {:.0} ms", saved.as_secs_f64() * 1e3));
 }
 
 /// Read changed folders (on idle threads), apply them, crawl new subtrees.
-fn refresh(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>, changed: Vec<Arc<[u8]>>) {
+/// `live`: changes reported as they happen (fanotify). Those are index
+/// updates and run at normal priority, never paused, so the index stays
+/// current on battery or under pressure; folders a verification sweep found
+/// changed are read on background threads, like the sweep itself.
+fn refresh(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>, changed: Vec<Arc<[u8]>>, live: bool) {
     if changed.is_empty() {
         return;
     }
@@ -330,10 +343,17 @@ fn refresh(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>, changed: Vec<Arc<
     thread::scope(|sc| {
         for _ in 0..cfg.workers.min(changed.len()).max(1) {
             sc.spawn(|| {
-                throttle::background_thread();
+                if !live {
+                    throttle::background_thread();
+                }
                 let mut mine = Vec::new();
                 while let Some(p) = changed.get(next.fetch_add(1, Relaxed)) {
-                    sh.throttle.wait();
+                    if STOP.load(Relaxed) {
+                        break;
+                    }
+                    if !live {
+                        sh.throttle.wait();
+                    }
                     mine.push(index::read_dir(p.clone()));
                 }
                 scans.lock().unwrap_or_else(PoisonError::into_inner).extend(mine);
@@ -350,7 +370,12 @@ fn refresh(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>, changed: Vec<Arc<
     };
     if !pending.is_empty() {
         let seen = AtomicUsize::new(0);
-        let (shards, errors) = index::crawl(&pending, &background_crawl(cfg, sh, skip, &seen));
+        let crawl = if live {
+            Crawl { workers: cfg.workers, cancel: &STOP, skip, with_meta: false, seen: &seen, init: &|| {}, pace: &|| {} }
+        } else {
+            background_crawl(cfg, sh, skip, &seen)
+        };
+        let (shards, errors) = index::crawl(&pending, &crawl);
         if let Some(idx) = sh.index.write().unwrap_or_else(PoisonError::into_inner).as_mut() {
             idx.add_shards(shards, errors);
         }
@@ -373,7 +398,7 @@ fn sweep(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>) {
     };
     let swept = t.elapsed();
     let n = changed.len();
-    refresh(sh, cfg, skip, changed);
+    refresh(sh, cfg, skip, changed, false);
     if !STOP.load(Relaxed) {
         sh.verified_ns.store(started, Relaxed);
     }
@@ -402,6 +427,14 @@ fn maintain(sh: &Shared, cfg: &Config, snap: &Path) {
         None
     };
 
+    // The folder map updates need, built under a read lock and installed
+    // with a brief write lock (queries never wait for its construction).
+    let built = sh.index.read().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|i| !i.has_map()).map(Index::build_map);
+    if let Some(map) = built
+        && let Some(idx) = sh.index.write().unwrap_or_else(PoisonError::into_inner).as_mut()
+    {
+        idx.install_map(map);
+    }
     let have = sh.index.read().unwrap_or_else(PoisonError::into_inner).is_some();
     if have {
         sweep(sh, cfg, &skip);
@@ -444,7 +477,7 @@ fn maintain(sh: &Shared, cfg: &Config, snap: &Path) {
         match events {
             Events::Dirs(dirs) if !dirs.is_empty() => {
                 sh.set_activity("updating");
-                refresh(sh, cfg, &skip, dirs.into_iter().map(Arc::from).collect());
+                refresh(sh, cfg, &skip, dirs.into_iter().map(Arc::from).collect(), true);
                 sh.set_activity("idle");
             }
             Events::Dirs(_) => {}
@@ -611,6 +644,7 @@ fn serve(sh: &Shared, mut s: UnixStream) {
             // Older clients stop here: whole result, name order.
             let order = r.u8().unwrap_or(proto::NAME_ASC);
             let first = r.u32().unwrap_or(u32::MAX) as usize;
+            let seq = r.u64().unwrap_or(0);
             if !scope.starts_with(b"/") || text.len() > 4096 {
                 return reply(&mut s, proto::ERROR, b"scope must be an absolute path; queries are limited to 4096 bytes");
             }
@@ -633,6 +667,9 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 drop(guard);
                 return reply(&mut s, proto::NOT_COVERED, &root);
             }
+            // Search as you type: a newer query from the same client (by the
+            // client's own numbering, not arrival order) makes this one
+            // obsolete. 0 means unnumbered: never superseded.
             let latest = {
                 let mut clients = sh.clients.lock().unwrap_or_else(PoisonError::into_inner);
                 if clients.len() > 256 {
@@ -640,8 +677,10 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 }
                 clients.entry(creds.pid).or_default().clone()
             };
-            let mine = latest.fetch_add(1, Relaxed) + 1;
-            let cancelled = || latest.load(Relaxed) != mine;
+            if seq != 0 {
+                latest.fetch_max(seq, Relaxed);
+            }
+            let cancelled = || seq != 0 && latest.load(Relaxed) > seq;
             let hits = if creds.uid == 0 || !sh.privileged {
                 idx.query_hits(&m, &scope, &cancelled, &Everything)
             } else {
@@ -665,10 +704,20 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 hits[..first].sort_unstable_by(|a, b| idx.hit_cmp(a, b, desc));
             }
             let kept = limit.min(hits.len());
-            let mut enc = Encoder::new(total);
-            // Small enough to sit in the socket buffer, so sending it under
-            // the index lock can't block on a slow client.
-            let sent = proto::send(&mut s, &enc.chunk(&idx.hit_rows(&hits[..first]), first == kept)).is_ok();
+            // Sent under the index lock, so it must fit in the socket buffer
+            // (a client that stops reading then can't block the send): fewer
+            // rows if long paths make it big. They stay a sorted prefix; the
+            // rest follow with the other rows.
+            let mut first = first;
+            let (mut enc, body) = loop {
+                let mut enc = Encoder::new(total);
+                let body = enc.chunk(&idx.hit_rows(&hits[..first]), first == kept);
+                if body.len() <= MAX_FIRST_BYTES || first <= 1 {
+                    break (enc, body);
+                }
+                first /= 2;
+            };
+            let sent = proto::send(&mut s, &body).is_ok();
             // Past the limit, keep the rows that come first by name.
             let mut tail = hits.split_off(first);
             idx.top_hits(&mut tail, kept - first, desc);
@@ -716,6 +765,9 @@ fn serve(sh: &Shared, mut s: UnixStream) {
 const CHUNK_ROWS: usize = 16 * 1024;
 /// Largest first chunk (rows); about 60 KB, well inside a socket buffer.
 const MAX_FIRST: usize = 1000;
+/// Largest first chunk in bytes: well inside a socket's default send buffer
+/// (about 208 KB), so sending it while holding the index lock never blocks.
+const MAX_FIRST_BYTES: usize = 64 * 1024;
 
 /// Encodes a streamed reply: the header goes with the first chunk, and
 /// each folder path is sent once, numbered across chunks.

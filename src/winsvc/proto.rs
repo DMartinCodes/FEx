@@ -6,7 +6,9 @@
 //!
 //! ```text
 //! request:  op u8 = QUERY, regex u8, limit u32, scope bytes, query bytes,
-//!           order u8 (NAME_ASC / NAME_DESC / UNORDERED), first u32
+//!           order u8 (NAME_ASC / NAME_DESC / UNORDERED), first u32,
+//!           seq u64 (the client's query number: a higher one from the same
+//!           process supersedes this query; 0 = never superseded)
 //!           op u8 = STATUS
 //! query reply:  OK, total u64, then chunks until one has `last` set
 //!               NOT_COVERED, roots bytes ("\n"-separated) | ERROR, msg | BUSY, msg
@@ -86,7 +88,8 @@ fn connect() -> io::Result<File> {
         if unsafe { GetLastError() } != ERROR_PIPE_BUSY || attempt == 1 {
             return Err(io::Error::last_os_error());
         }
-        unsafe { WaitNamedPipeW(name.as_ptr(), 500) };
+        // All instances busy for a moment (between connections): wait for one.
+        unsafe { WaitNamedPipeW(name.as_ptr(), 2000) };
     }
     Err(io::Error::other("index pipe busy"))
 }
@@ -143,7 +146,7 @@ impl Stream {
 }
 
 /// Ask the service for matches under `scope`. `Err` when it isn't running.
-pub fn query(scope: &str, text: &str, regex: bool, limit: u32, order: u8, first: u32) -> io::Result<Reply> {
+pub fn query(scope: &str, text: &str, regex: bool, limit: u32, order: u8, first: u32, seq: u64) -> io::Result<Reply> {
     let mut p = connect()?;
     let mut req = vec![QUERY, regex as u8];
     put_u32(&mut req, limit.min(MAX_LIMIT));
@@ -151,6 +154,7 @@ pub fn query(scope: &str, text: &str, regex: bool, limit: u32, order: u8, first:
     put_bytes(&mut req, text.as_bytes());
     req.push(order);
     put_u32(&mut req, first);
+    put_u64(&mut req, seq);
     wire::send(&mut p, &req)?;
     let body = wire::recv(&mut p, usize::MAX >> 1)?;
     let mut r = Reader::new(&body);

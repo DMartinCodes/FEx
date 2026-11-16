@@ -104,8 +104,11 @@ enum Msg {
     Service(Option<service::Status>),
     /// More rows of a search answered by the index service; `done` on the last.
     ServiceMore { generation: u64, rows: Vec<Row>, done: bool },
-    /// The index service couldn't answer; search with the app's own index.
-    ServiceFailed { generation: u64 },
+    /// The index service couldn't answer. `definitive`: it said it can't
+    /// (drive not covered, first index still building), so search with the
+    /// app's own index; else it didn't answer twice running, so report it
+    /// rather than start a crawl (the status poll notices a stopped service).
+    ServiceFailed { generation: u64, definitive: bool },
     /// Segoe UI Emoji, loaded after startup (it's 13 MB).
     EmojiFont(Vec<u8>),
     DriveSpace { path: String, is_network: bool, queried: bool, ejectable: bool, result: Option<(u64, u64)> },
@@ -1428,7 +1431,14 @@ impl FexApp {
                 ctx.request_repaint();
                 ok
             };
-            match service::query(&scope, &text, regex, MAX_RESULTS as u32, order, SCREENFUL) {
+            let ask = || service::query(&scope, &text, regex, MAX_RESULTS as u32, order, SCREENFUL, generation);
+            let mut reply = ask();
+            // A busy or momentarily refused connection gets one more try.
+            if reply.is_err() && current.load(Relaxed) == generation {
+                thread::sleep(Duration::from_millis(150));
+                reply = ask();
+            }
+            match reply {
                 Ok(service::Reply::Rows { rows, total, mut rest }) => {
                     if !send(Msg::QueryDone { generation, rows, total, elapsed: t.elapsed(), sorted }) {
                         return;
@@ -1443,8 +1453,11 @@ impl FexApp {
                         }
                     }
                 }
-                _ => {
-                    send(Msg::ServiceFailed { generation });
+                Ok(_) => {
+                    send(Msg::ServiceFailed { generation, definitive: true });
+                }
+                Err(_) => {
+                    send(Msg::ServiceFailed { generation, definitive: false });
                 }
             }
         });
@@ -1665,9 +1678,14 @@ impl FexApp {
                         self.rebuild_view_keeping(focus);
                     }
                 }
-                Msg::ServiceFailed { generation } if generation == current => {
-                    self.service_failed = true;
-                    self.start_search(generation);
+                Msg::ServiceFailed { generation, definitive } if generation == current => {
+                    if definitive {
+                        self.service_failed = true;
+                        self.start_search(generation);
+                    } else {
+                        self.searching = false;
+                        self.error = Some("The index service didn't answer; search again in a moment.".into());
+                    }
                 }
                 Msg::QueryDone { generation, rows, total, elapsed, sorted } if generation == current => {
                     let focus = self.focus_key();

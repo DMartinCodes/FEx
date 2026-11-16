@@ -4,7 +4,9 @@
 //!
 //! ```text
 //! request:  op u8 = QUERY, regex u8, limit u32, scope bytes, query bytes,
-//!           order u8 (NAME_ASC / NAME_DESC / UNORDERED), first u32
+//!           order u8 (NAME_ASC / NAME_DESC / UNORDERED), first u32,
+//!           seq u64 (the client's query number: a higher one from the same
+//!           process supersedes this query; 0 = never superseded)
 //!           op u8 = STATUS
 //! query reply:  OK, total u64, then chunks until one has `last` set
 //!               NOT_COVERED, root bytes  |  ERROR, message bytes  |  BUSY, message bytes
@@ -130,7 +132,7 @@ fn connect() -> io::Result<UnixStream> {
 
 /// Ask the daemon for matches under `scope`. The reply's first chunk holds
 /// the `first` rows that come first in `order`. `Err` when there is no daemon.
-pub fn query(scope: &[u8], text: &str, regex: bool, limit: u32, order: u8, first: u32) -> io::Result<Reply> {
+pub fn query(scope: &[u8], text: &str, regex: bool, limit: u32, order: u8, first: u32, seq: u64) -> io::Result<Reply> {
     let mut s = connect()?;
     let mut req = vec![QUERY, regex as u8];
     put_u32(&mut req, limit.min(MAX_LIMIT));
@@ -138,6 +140,7 @@ pub fn query(scope: &[u8], text: &str, regex: bool, limit: u32, order: u8, first
     put_bytes(&mut req, text.as_bytes());
     req.push(order);
     put_u32(&mut req, first);
+    put_u64(&mut req, seq);
     send(&mut s, &req)?;
     let body = recv(&mut s, usize::MAX >> 1)?;
     let mut r = Reader::new(&body);

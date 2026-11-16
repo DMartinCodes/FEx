@@ -45,8 +45,11 @@ enum Msg {
     Fonts(Option<String>),
     /// Latest status of the index daemon (`None`: not running).
     Daemon(Option<proto::Status>),
-    /// The daemon couldn't answer this query; search in-process instead.
-    DaemonFailed { generation: u64 },
+    /// The daemon couldn't answer this query. `definitive`: it said it can't
+    /// (not covered, still building, refused), so search in-process; else it
+    /// didn't answer twice running, so report it rather than start a crawl
+    /// (the status poll notices a daemon that is really gone).
+    DaemonFailed { generation: u64, definitive: bool },
 }
 
 struct Results {
@@ -599,7 +602,14 @@ impl App {
                 ctx.request_repaint();
                 ok
             };
-            match proto::query(&scope, &text, regex, MAX_RESULTS as u32, order, SCREENFUL) {
+            let ask = || proto::query(&scope, &text, regex, MAX_RESULTS as u32, order, SCREENFUL, generation);
+            let mut reply = ask();
+            // A busy or momentarily refused connection gets one more try.
+            if reply.is_err() && current.load(Relaxed) == generation {
+                thread::sleep(Duration::from_millis(150));
+                reply = ask();
+            }
+            match reply {
                 Ok(proto::Reply::Rows { rows, total, mut rest }) => {
                     if !send(Msg::Results { generation, rows, total, first: t.elapsed(), complete: false }) {
                         return;
@@ -614,8 +624,11 @@ impl App {
                         }
                     }
                 }
-                _ => {
-                    send(Msg::DaemonFailed { generation });
+                Ok(_) => {
+                    send(Msg::DaemonFailed { generation, definitive: true });
+                }
+                Err(_) => {
+                    send(Msg::DaemonFailed { generation, definitive: false });
                 }
             }
         });
@@ -751,9 +764,14 @@ impl App {
                     self.daemon_failed = false;
                     self.daemon = st;
                 }
-                Msg::DaemonFailed { generation } if generation == self.query_gen.load(Relaxed) => {
-                    self.daemon_failed = true;
-                    self.start_search();
+                Msg::DaemonFailed { generation, definitive } if generation == self.query_gen.load(Relaxed) => {
+                    if definitive {
+                        self.daemon_failed = true;
+                        self.start_search();
+                    } else {
+                        self.searching = false;
+                        self.search_error = Some("The index daemon didn't answer; search again in a moment.".into());
+                    }
                 }
                 _ => {}
             }

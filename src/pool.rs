@@ -1,5 +1,10 @@
 //! Persistent worker threads for short parallel bursts (index queries,
 //! sorting results), so each burst doesn't pay for spawning a thread per core.
+//!
+//! Several bursts can run at once (queries from different clients of the
+//! index daemon or service): each caller works on its own batch, and idle
+//! workers take one item at a time from the active batches in turn, so a
+//! long batch doesn't hold up a short one.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,13 +28,41 @@ struct Batch {
 unsafe impl Send for Batch {}
 unsafe impl Sync for Batch {}
 
+impl Batch {
+    fn has_work(&self) -> bool {
+        self.next.load(Ordering::Relaxed) < self.n
+    }
+
+    /// Claim and run one item; false when none was left.
+    fn run_one(&self, p: &Pool) -> bool {
+        let i = self.next.fetch_add(1, Ordering::Relaxed);
+        if i >= self.n {
+            return false;
+        }
+        // SAFETY: see `Batch::task`.
+        let f = unsafe { &*self.task };
+        if catch_unwind(AssertUnwindSafe(|| f(i))).is_err() {
+            self.panicked.store(true, Ordering::Relaxed);
+        }
+        if self.done.fetch_add(1, Ordering::AcqRel) + 1 == self.n {
+            let _g = lock(&p.state);
+            p.finished.notify_all();
+        }
+        true
+    }
+}
+
+struct State {
+    /// Batches with unclaimed items (or not yet removed by their caller).
+    active: Vec<Arc<Batch>>,
+    /// Where the next idle worker starts looking, for fairness.
+    cursor: usize,
+}
+
 struct Pool {
-    /// (batch number, current batch)
-    current: Mutex<(u64, Option<Arc<Batch>>)>,
+    state: Mutex<State>,
     wake: Condvar,
     finished: Condvar,
-    /// One batch at a time.
-    busy: Mutex<()>,
     workers: usize,
 }
 
@@ -45,49 +78,37 @@ fn pool() -> &'static Pool {
         let workers = (1..std::thread::available_parallelism().map_or(4, |n| n.get()))
             .filter(|_| thread::Builder::new().name("fex-pool".into()).spawn(worker).is_ok())
             .count();
-        Pool {
-            current: Mutex::new((0, None)),
-            wake: Condvar::new(),
-            finished: Condvar::new(),
-            busy: Mutex::new(()),
-            workers,
-        }
+        Pool { state: Mutex::new(State { active: Vec::new(), cursor: 0 }), wake: Condvar::new(), finished: Condvar::new(), workers }
     })
+}
+
+/// The next batch with work, taking batches in turn.
+fn pick(st: &mut State) -> Option<Arc<Batch>> {
+    let n = st.active.len();
+    for k in 0..n {
+        let i = (st.cursor + k) % n;
+        if st.active[i].has_work() {
+            st.cursor = i + 1;
+            return Some(st.active[i].clone());
+        }
+    }
+    None
 }
 
 fn worker() {
     let p = pool();
-    let mut seen = 0;
     loop {
         let batch = {
-            let mut g = lock(&p.current);
-            while g.0 == seen {
+            let mut g = lock(&p.state);
+            loop {
+                if let Some(b) = pick(&mut g) {
+                    break b;
+                }
                 g = p.wake.wait(g).unwrap_or_else(PoisonError::into_inner);
             }
-            seen = g.0;
-            g.1.clone()
         };
-        if let Some(b) = batch {
-            work(p, &b);
-        }
-    }
-}
-
-fn work(p: &Pool, b: &Batch) {
-    loop {
-        let i = b.next.fetch_add(1, Ordering::Relaxed);
-        if i >= b.n {
-            return;
-        }
-        // SAFETY: see `Batch::task`.
-        let f = unsafe { &*b.task };
-        if catch_unwind(AssertUnwindSafe(|| f(i))).is_err() {
-            b.panicked.store(true, Ordering::Relaxed);
-        }
-        if b.done.fetch_add(1, Ordering::AcqRel) + 1 == b.n {
-            let _g = lock(&p.current);
-            p.finished.notify_all();
-        }
+        // One item, then look again, so concurrent batches share the workers.
+        batch.run_one(p);
     }
 }
 
@@ -103,27 +124,71 @@ pub fn for_each(n: usize, f: &(dyn Fn(usize) + Sync)) -> bool {
         return true;
     }
     let p = pool();
-    let _one = lock(&p.busy);
     // SAFETY: only the lifetime is erased; we wait below until no thread can call it.
     let task: *const Task = unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const Task>(f) };
-    let batch = Arc::new(Batch {
-        task,
-        n,
-        next: AtomicUsize::new(0),
-        done: AtomicUsize::new(0),
-        panicked: AtomicBool::new(false),
-    });
-    {
-        let mut g = lock(&p.current);
-        g.0 += 1;
-        g.1 = Some(batch.clone());
-        p.wake.notify_all();
-    }
-    work(p, &batch);
-    let mut g = lock(&p.current);
+    let batch = Arc::new(Batch { task, n, next: AtomicUsize::new(0), done: AtomicUsize::new(0), panicked: AtomicBool::new(false) });
+    lock(&p.state).active.push(batch.clone());
+    p.wake.notify_all();
+    while batch.run_one(p) {}
+    let mut g = lock(&p.state);
     while batch.done.load(Ordering::Acquire) < n {
         g = p.finished.wait(g).unwrap_or_else(PoisonError::into_inner);
     }
-    g.1 = None;
+    g.active.retain(|b| !Arc::ptr_eq(b, &batch));
     !batch.panicked.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn concurrent_batches_all_complete() {
+        let handles: Vec<_> = (0..6)
+            .map(|t| {
+                thread::spawn(move || {
+                    let sum = AtomicUsize::new(0);
+                    assert!(for_each(1000, &|i| {
+                        sum.fetch_add(i + t, Ordering::Relaxed);
+                    }));
+                    sum.load(Ordering::Relaxed)
+                })
+            })
+            .collect();
+        for (t, h) in handles.into_iter().enumerate() {
+            assert_eq!(h.join().unwrap(), (0..1000).sum::<usize>() + 1000 * t);
+        }
+    }
+
+    #[test]
+    fn a_long_batch_does_not_hold_up_a_short_one() {
+        let slow = thread::spawn(|| {
+            let t = Instant::now();
+            for_each(threads() * 2, &|_| thread::sleep(Duration::from_millis(300)));
+            t.elapsed()
+        });
+        thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        let ran = AtomicUsize::new(0);
+        for_each(4, &|_| {
+            ran.fetch_add(1, Ordering::Relaxed);
+        });
+        let quick = t.elapsed();
+        assert_eq!(ran.load(Ordering::Relaxed), 4);
+        assert!(quick < Duration::from_millis(250), "short batch waited {quick:?}");
+        assert!(slow.join().unwrap() >= Duration::from_millis(550));
+    }
+
+    #[test]
+    fn nested_batches_and_panics() {
+        let inner = AtomicUsize::new(0);
+        assert!(for_each(4, &|_| {
+            for_each(4, &|_| {
+                inner.fetch_add(1, Ordering::Relaxed);
+            });
+        }));
+        assert_eq!(inner.load(Ordering::Relaxed), 16);
+        assert!(!for_each(3, &|i| assert_ne!(i, 1)));
+    }
 }

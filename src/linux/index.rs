@@ -21,7 +21,8 @@
 //! * Queries take a `Visibility`, so the daemon can show each user only
 //!   folders they could list themselves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -322,6 +323,9 @@ const CHUNK: usize = 32 * 1024;
 
 /// (shard, folder) within an index.
 type DirRef = (u32, u32);
+/// Folder path -> its live listing. Ordered, so a folder's whole subtree is
+/// one range of keys (see `subtree`).
+pub type FolderMap = BTreeMap<Box<[u8]>, DirRef>;
 /// (shard, entry): one search match.
 pub type Hit = (u32, u32);
 /// A re-read folder: its ctime and (name, flags) entries.
@@ -363,7 +367,7 @@ pub struct Index {
     dead: Vec<Vec<bool>>,
     /// Folder path -> (shard, folder) of its live listing. Built when the
     /// first update needs it, so loading a snapshot stays instant.
-    map: Option<HashMap<Box<[u8]>, DirRef>>,
+    map: Option<FolderMap>,
     overlay: Option<usize>,
     /// Live entries and folders.
     pub entries: usize,
@@ -626,17 +630,33 @@ impl Index {
         found.into_inner().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn map(&mut self) -> &mut HashMap<Box<[u8]>, DirRef> {
-        if self.map.is_none() {
-            let mut map = HashMap::with_capacity(self.dirs);
-            for (s, shard) in self.shards.iter().enumerate() {
-                for d in 0..shard.ndirs() {
-                    if !self.dead[s][d] {
-                        map.insert(shard.dir_path(d).into(), (s as u32, d as u32));
-                    }
+    /// The folder map, computed from a shared reference: build it under a
+    /// read lock and `install_map` it with a brief write lock, rather than
+    /// letting the first update build it while holding the write lock.
+    pub fn build_map(&self) -> FolderMap {
+        let mut map = FolderMap::new();
+        for (s, shard) in self.shards.iter().enumerate() {
+            for d in 0..shard.ndirs() {
+                if !self.dead[s][d] {
+                    map.insert(shard.dir_path(d).into(), (s as u32, d as u32));
                 }
             }
-            self.map = Some(map);
+        }
+        map
+    }
+
+    /// Use a map from `build_map` (of this same index, unchanged since).
+    pub fn install_map(&mut self, map: FolderMap) {
+        self.map = Some(map);
+    }
+
+    pub fn has_map(&self) -> bool {
+        self.map.is_some()
+    }
+
+    fn map(&mut self) -> &mut FolderMap {
+        if self.map.is_none() {
+            self.map = Some(self.build_map());
         }
         self.map.as_mut().unwrap()
     }
@@ -711,26 +731,10 @@ impl Index {
                 }
             }
         }
-        if !doomed.is_empty() {
-            // Each folder's ancestors are checked against the doomed set:
-            // one pass over the folders however many subtrees go.
-            let victims: Vec<(Box<[u8]>, DirRef)> = self
-                .map()
-                .iter()
-                .filter(|(k, _)| {
-                    let mut p: &[u8] = k;
-                    loop {
-                        if doomed.contains(p) {
-                            return true;
-                        }
-                        match memchr::memrchr(b'/', p) {
-                            Some(i) if i > 0 => p = &p[..i],
-                            _ => return false,
-                        }
-                    }
-                })
-                .map(|(k, v)| (k.clone(), *v))
-                .collect();
+        // Each doomed subtree is a range of the ordered map: cost in
+        // proportion to what goes, not to the size of the index.
+        for root in &doomed {
+            let victims = subtree(self.map(), root);
             for (k, (s, d)) in victims {
                 self.kill(s, d);
                 self.map().remove(&k);
@@ -787,6 +791,13 @@ impl Index {
 
     /// Write the live index to `path` as a snapshot (compacting it).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        self.save_image().write(path)
+    }
+
+    /// The compacted snapshot contents, in memory: take this under the index
+    /// lock, then `write` it with the lock released (disk I/O and fsync
+    /// shouldn't hold up updates, or the queries queued behind them).
+    pub fn save_image(&self) -> SaveImage {
         let c = self.compacted();
         let info = snapshot::Info {
             created_ns: now_ns(),
@@ -795,19 +806,7 @@ impl Index {
             errors: self.errors as u64,
             build_ns: self.build_time.as_nanos() as u64,
         };
-        let secs: [&[u8]; snapshot::SECTIONS] = [
-            &self.root,
-            &c.names,
-            &c.lower,
-            snapshot::section(&c.starts),
-            snapshot::section(&c.entry_dir),
-            &c.entry_flags,
-            &c.dir_paths,
-            snapshot::section(&c.dir_starts),
-            snapshot::section(&c.ranges),
-            snapshot::section(&c.dir_ctime),
-        ];
-        snapshot::write(path, info, &secs)
+        SaveImage { root: self.root.clone(), shard: c, info }
     }
 
     /// Map a snapshot. Its data is as fresh as when it was written; `sweep`
@@ -835,6 +834,48 @@ impl Index {
         index.created_ns = l.info.created_ns;
         index.from_snapshot = true;
         Ok(index)
+    }
+}
+
+/// The folder at `root` and every folder beneath it. Keys under `root/` sort
+/// together between `root/` and `root0` ('0' follows '/'), apart from names
+/// like `root b` that sort between `root` and `root/`.
+fn subtree(map: &FolderMap, root: &[u8]) -> Vec<(Box<[u8]>, DirRef)> {
+    // `/` (the only key ending in a separator) falls inside its own range.
+    let (trimmed, exact) = match root.strip_suffix(b"/") {
+        Some(t) => (t, None),
+        None => (root, map.get(root)),
+    };
+    let mut out: Vec<(Box<[u8]>, DirRef)> = exact.map(|&v| (Box::from(root), v)).into_iter().collect();
+    let lo = [trimmed, b"/"].concat();
+    let hi = [trimmed, b"0"].concat();
+    out.extend(map.range::<[u8], _>((Bound::Included(&lo[..]), Bound::Excluded(&hi[..]))).map(|(k, v)| (k.clone(), *v)));
+    out
+}
+
+/// A snapshot ready to be written (see `Index::save_image`).
+pub struct SaveImage {
+    root: Arc<[u8]>,
+    shard: Shard,
+    info: snapshot::Info,
+}
+
+impl SaveImage {
+    pub fn write(&self, path: &Path) -> std::io::Result<()> {
+        let c = &self.shard;
+        let secs: [&[u8]; snapshot::SECTIONS] = [
+            &self.root,
+            &c.names,
+            &c.lower,
+            snapshot::section(&c.starts),
+            snapshot::section(&c.entry_dir),
+            &c.entry_flags,
+            &c.dir_paths,
+            snapshot::section(&c.dir_starts),
+            snapshot::section(&c.ranges),
+            snapshot::section(&c.dir_ctime),
+        ];
+        snapshot::write(path, self.info, &secs)
     }
 }
 
@@ -1005,6 +1046,21 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subtrees_are_exact_ranges() {
+        let mut map = FolderMap::new();
+        for (i, k) in [&b"/a/b"[..], b"/a/b c", b"/a/b-x", b"/a/b/x", b"/a/b/x/y", b"/a/b0", b"/a/bc", b"/a"].iter().enumerate() {
+            map.insert(Box::from(*k), (0, i as u32));
+        }
+        let mut got: Vec<Vec<u8>> = subtree(&map, b"/a/b").into_iter().map(|(k, _)| k.into_vec()).collect();
+        got.sort();
+        assert_eq!(got, [b"/a/b".to_vec(), b"/a/b/x".to_vec(), b"/a/b/x/y".to_vec()]);
+        assert_eq!(subtree(&map, b"/").len(), map.len());
+        map.insert(Box::from(&b"/"[..]), (1, 0));
+        assert_eq!(subtree(&map, b"/").len(), map.len());
+        assert!(subtree(&map, b"/nope").is_empty());
     }
 
     /// Every name under `root` per a fresh crawl, for comparisons.
