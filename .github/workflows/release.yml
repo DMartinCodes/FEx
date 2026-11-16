@@ -15,10 +15,10 @@ name: release
 on:
   push:
     tags: ["v*"]
-    # Dry runs when this workflow changes on a working branch (tag pushes
-    # ignore the path filter).
+    # Dry runs when the release, signing or update code changes on a working
+    # branch (tag pushes ignore the path filter).
     branches: ["claude/**"]
-    paths: [".github/workflows/release.yml"]
+    paths: [".github/workflows/release.yml", "packaging/sign-release.sh", "packaging/release-keys.pub", "src/update/**", ".gitattributes"]
   workflow_dispatch:
 
 permissions:
