@@ -1,7 +1,8 @@
 # Release builds. Pushing a tag `vX.Y.Z` (matching Cargo.toml's version)
 # builds, tests and packages both platforms and publishes a GitHub release.
-# Run it by hand (workflow_dispatch) for a dry run: the same builds and
-# packages, uploaded as an artifact, with no release.
+# Run it by hand (workflow_dispatch), or change this file on a claude/**
+# branch, for a dry run: the same builds and packages, uploaded as an
+# artifact, with no release.
 #
 # Linux builds on Rocky Linux 8 so the binary needs only glibc 2.28: it runs
 # on Rocky/RHEL 8 and 9, Ubuntu 20.04 and later, Debian 11 and later.
@@ -10,6 +11,10 @@ name: release
 on:
   push:
     tags: ["v*"]
+    # Dry runs when this workflow changes on a working branch (tag pushes
+    # ignore the path filter).
+    branches: ["claude/**"]
+    paths: [".github/workflows/release.yml"]
   workflow_dispatch:
 
 permissions:
