@@ -129,6 +129,35 @@ reserve, and back once they have it. Override with `--reserve PCT` or by
 editing `/var/lib/fex/profile`. The policy is shared with Windows
 (`src/reserve.rs`).
 
+**Memory.** The same deal as CPU: the daemon uses memory freely but gives
+it back before other programs have to. Each second it reads available
+memory (`/proc/meminfo`) and how long other processes stalled on memory
+(system memory PSI minus its own cgroup's), and sets a level (shared with
+Windows, `src/memory.rs`):
+- *Tight*: available below `--memory-floor` (10%), or others stalled over
+  10% of the time. Background work pauses; freed heap goes back to the OS
+  (`malloc_trim`) and the mapped index is marked cold (`MADV_COLD`), so the
+  kernel reclaims it before other programs' pages.
+- *Critical*: below half the floor, or stalls over 25%. Also drops the
+  folder map (rebuilt when an update needs it), folds changes held in heap
+  into the snapshot if they exceed 4 MB, and pages the mapped index out now
+  (`MADV_PAGEOUT`).
+
+Levels ease only once readings are clearly better (1.5x the floor, stalls
+under 5%), so the daemon doesn't flap. Queries and live (fanotify) updates
+keep running at every level; a query after a shed pages the index back in.
+Shedding runs on its own thread, re-applied every 30 s while the level stays
+up; `kill -USR1` sheds at once. `fex status` shows resident memory (heap and
+file-backed) and the level. The unit adds backstops: `MemoryHigh=25%`
+(reclaim from the daemon first above that) and `OOMScoreAdjust=500` (if
+the OOM killer must pick, the daemon goes before interactive programs; it
+restarts from its snapshot in milliseconds).
+
+Measured (237K entries, `kill -USR1`): resident 37.3 -> 22.1 MB (heap
+20.0 -> 16.3, file-backed 17.3 -> 5.8), queries unaffected. With the floor
+forced to 99%, background work paused at once and a live change was still
+searchable within 6 ms; the daemon stops within about 1.5 s while paused.
+
 ## Design decisions (from the discovery review)
 
 - **Names are bytes.** Linux filenames are any bytes except `/` and NUL, so

@@ -380,6 +380,8 @@ pub struct Index {
     /// Bumped by every change.
     pub generation: u64,
     pub from_snapshot: bool,
+    /// The snapshot file the base shard is mapped from, if any.
+    mapped: Option<Arc<snapshot::Mapping>>,
 }
 
 /// A folder's current listing, read outside the index lock. `listing` is
@@ -420,6 +422,7 @@ impl Index {
             created_ns: now_ns(),
             generation: 0,
             from_snapshot: false,
+            mapped: None,
         }
     }
 
@@ -654,6 +657,19 @@ impl Index {
         self.map.is_some()
     }
 
+    /// Drop the folder map to give its memory back (rebuilt when an update
+    /// next needs it). Returns roughly how many bytes it held.
+    pub fn drop_map(&mut self) -> usize {
+        self.map.take().map_or(0, |m| m.keys().map(|k| k.len() + 64).sum())
+    }
+
+    /// Advise the kernel about the mapped snapshot (see `Mapping::advise`).
+    pub fn advise_mapped(&self, advice: libc::c_int) {
+        if let Some(m) = &self.mapped {
+            m.advise(advice);
+        }
+    }
+
     fn map(&mut self) -> &mut FolderMap {
         if self.map.is_none() {
             self.map = Some(self.build_map());
@@ -859,6 +875,7 @@ impl Index {
         let mut index = Index::from_shards(root.to_vec().into(), vec![shard], l.info.errors as usize, Duration::from_nanos(l.info.build_ns));
         index.created_ns = l.info.created_ns;
         index.from_snapshot = true;
+        index.mapped = Some(l.map.clone());
         Ok(index)
     }
 }

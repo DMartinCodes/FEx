@@ -34,6 +34,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::fanotify::{Events, Fanotify};
+use crate::memory;
 use super::profile::{self, Profile};
 use super::index::{self, Crawl, Everything, Index, Matcher, Visibility};
 use super::proto::{self, Reader};
@@ -55,12 +56,20 @@ pub struct Config {
     pub io_limit: f64,
     /// CPU share reserved under full load, overriding the profile's.
     pub reserve: Option<f64>,
+    /// Give memory back when less than this fraction of it is available.
+    pub memory_floor: f64,
 }
 
 /// Concurrent client connections served; more wait in the listen queue.
 const MAX_CLIENTS: usize = 32;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+/// SIGUSR1: give back all the memory the daemon can, now.
+static SHED_NOW: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_usr1(_: libc::c_int) {
+    SHED_NOW.store(true, Relaxed);
+}
 
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Relaxed);
@@ -78,6 +87,9 @@ struct Shared {
     /// Running as root: can filter per user. Otherwise serves only its own uid.
     privileged: bool,
     dirty: AtomicBool,
+    /// The memory thread asks the maintenance thread to fold heap-held
+    /// changes into the snapshot.
+    compact_requested: AtomicBool,
     /// Folders left out of the index (`skips`): queries inside them are not
     /// covered, so clients search them themselves.
     skip: RwLock<HashSet<Vec<u8>>>,
@@ -142,6 +154,7 @@ pub fn run(cfg: Config) -> ExitCode {
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGUSR1, on_usr1 as *const () as libc::sighandler_t);
     }
     let privileged = unsafe { libc::geteuid() } == 0;
     if let Err(e) = std::fs::create_dir_all(&cfg.state_dir) {
@@ -183,7 +196,7 @@ pub fn run(cfg: Config) -> ExitCode {
         }
     };
     log(&format!("profile: {}", profile.describe().replace('\n', "; ")));
-    let throttle = Throttle::start(cfg.io_limit, cfg.reserve.unwrap_or(profile.reserve), profile.cores);
+    let throttle = Throttle::start(cfg.io_limit, cfg.reserve.unwrap_or(profile.reserve), profile.cores, cfg.memory_floor);
     if !throttle.own_cgroup {
         log("not in a cgroup of its own: its own I/O stalls count as pressure (run it as a systemd service for accurate throttling)");
     }
@@ -201,6 +214,7 @@ pub fn run(cfg: Config) -> ExitCode {
         privileged,
         dirty: AtomicBool::new(false),
         skip: RwLock::new(skip.clone()),
+        compact_requested: AtomicBool::new(false),
         clients: Mutex::new(HashMap::new()),
     });
 
@@ -231,6 +245,10 @@ pub fn run(cfg: Config) -> ExitCode {
     sd_notify("READY=1");
 
     let cfg = Arc::new(cfg);
+    {
+        let sh = shared.clone();
+        thread::Builder::new().name("fex-memory".into()).spawn(move || watch_memory(&sh)).ok();
+    }
     let maint = {
         let (sh, cfg, snap) = (shared.clone(), cfg.clone(), snap.clone());
         thread::Builder::new().name("fex-maintain".into()).spawn(move || maintain(&sh, &cfg, &snap)).ok()
@@ -361,6 +379,7 @@ fn refresh(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>, changed: Vec<Arc<
         }
     });
     let scans = scans.into_inner().unwrap_or_else(PoisonError::into_inner);
+    ensure_map(sh);
     let pending = {
         let mut g = sh.index.write().unwrap_or_else(PoisonError::into_inner);
         match g.as_mut() {
@@ -399,9 +418,11 @@ fn sweep(sh: &Shared, cfg: &Config, skip: &HashSet<Vec<u8>>) {
     let swept = t.elapsed();
     let n = changed.len();
     refresh(sh, cfg, skip, changed, false);
-    if !STOP.load(Relaxed) {
-        sh.verified_ns.store(started, Relaxed);
+    if STOP.load(Relaxed) {
+        log("verification stopped");
+        return;
     }
+    sh.verified_ns.store(started, Relaxed);
     log(&format!("verified in {:.0} ms; {n} folders changed, updated in {:.0} ms", swept.as_secs_f64() * 1e3, (t.elapsed() - swept).as_secs_f64() * 1e3));
     sh.set_activity("idle");
 }
@@ -466,6 +487,7 @@ fn maintain(sh: &Shared, cfg: &Config, snap: &Path) {
 
     let mut last_sweep = Instant::now();
     let mut last_save = Instant::now();
+
     while !STOP.load(Relaxed) {
         let events = match &fan {
             Some(f) => f.wait(1000),
@@ -495,12 +517,109 @@ fn maintain(sh: &Shared, cfg: &Config, snap: &Path) {
             sweep(sh, cfg, &skip);
             last_sweep = Instant::now();
         }
+        // Memory critical: changes held in heap move into the (reclaimable)
+        // mapped snapshot. Done here, the only thread that saves.
+        if sh.compact_requested.swap(false, Relaxed) {
+            save(sh, snap, true);
+            last_save = Instant::now();
+        }
         let compact = sh.index.read().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(Index::needs_compaction);
         if sh.dirty.load(Relaxed) && (compact || last_save.elapsed() >= cfg.save_every) {
             save(sh, snap, true);
             last_save = Instant::now();
         }
     }
+}
+
+// ------------------------------------------------------------ memory
+
+/// Resident and anonymous (heap) memory of this process, in kB.
+fn resident_kb() -> (u64, u64) {
+    let text = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+    let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.trim().trim_end_matches("kB").trim().parse::<u64>().ok()).unwrap_or(0);
+    (field("Rss:"), field("Anonymous:"))
+}
+
+fn memory_state(sh: &Shared) -> String {
+    let (rss, anon) = resident_kb();
+    format!(
+        "{:.1} MB resident ({:.1} MB heap, {:.1} MB file-backed) · {} ({:.0}% of memory available)",
+        rss as f64 / 1024.0,
+        anon as f64 / 1024.0,
+        rss.saturating_sub(anon) as f64 / 1024.0,
+        sh.throttle.memory_level().name(),
+        sh.throttle.memory_available() * 100.0
+    )
+}
+
+/// The folder map, built under a read lock if it was dropped, so updates
+/// never build it while holding the write lock.
+fn ensure_map(sh: &Shared) {
+    let built = sh.index.read().unwrap_or_else(PoisonError::into_inner).as_ref().filter(|i| !i.has_map()).map(Index::build_map);
+    if let Some(map) = built
+        && let Some(idx) = sh.index.write().unwrap_or_else(PoisonError::into_inner).as_mut()
+        && !idx.has_map()
+    {
+        idx.install_map(map);
+    }
+}
+
+/// Shed memory when the level rises, and again every 30 s while it stays up
+/// (what was freed may have been refilled since); SIGUSR1 sheds at once. On
+/// a thread of its own, so it works while the maintenance thread is busy
+/// with (or paused in) a crawl or sweep.
+fn watch_memory(sh: &Shared) {
+    let mut was = memory::Level::Normal;
+    let mut last = Instant::now();
+    while !STOP.load(Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+        let level = sh.throttle.memory_level();
+        if SHED_NOW.swap(false, Relaxed) {
+            shed(sh, memory::Level::Critical, "on request");
+            last = Instant::now();
+        } else if level > was || (level != memory::Level::Normal && last.elapsed() >= Duration::from_secs(30)) {
+            shed(sh, level, &format!("{:.0}% of memory available", sh.throttle.memory_available() * 100.0));
+            last = Instant::now();
+        }
+        was = level;
+    }
+}
+
+/// Give memory back (background work already pauses while memory is tight).
+/// Tight: return freed heap to the OS and mark the mapped index cold, so the
+/// kernel reclaims it before other programs' memory. Critical: also drop the
+/// folder map (rebuilt when an update needs it), have changes held in heap
+/// folded into the snapshot, and page the mapped index out now.
+fn shed(sh: &Shared, level: memory::Level, why: &str) {
+    let (before, _) = resident_kb();
+    let mut dropped = 0;
+    if level == memory::Level::Critical {
+        let overlay = {
+            let mut g = sh.index.write().unwrap_or_else(PoisonError::into_inner);
+            g.as_mut().map_or(0, |idx| {
+                dropped = idx.drop_map();
+                idx.bytes()
+            })
+        };
+        if overlay > 4 << 20 {
+            sh.compact_requested.store(true, Relaxed);
+        }
+    }
+    if let Some(idx) = sh.index.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        idx.advise_mapped(if level == memory::Level::Critical { libc::MADV_PAGEOUT } else { libc::MADV_COLD });
+    }
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    let (after, _) = resident_kb();
+    log(&format!(
+        "memory {} ({why}): resident {:.1} -> {:.1} MB{}",
+        level.name(),
+        before as f64 / 1024.0,
+        after as f64 / 1024.0,
+        if dropped > 0 { format!(", folder map ({:.1} MB) dropped", dropped as f64 / 1048576.0) } else { String::new() }
+    ));
 }
 
 // ------------------------------------------------------------ clients
@@ -744,6 +863,7 @@ fn serve(sh: &Shared, mut s: UnixStream) {
                 activity: sh.activity.lock().unwrap_or_else(PoisonError::into_inner).to_string(),
                 paused: sh.throttle.paused().unwrap_or_default(),
                 reserve: sh.throttle.reserve_state(),
+                memory: memory_state(sh),
                 ..Default::default()
             };
             if let Some(i) = g.as_ref() {

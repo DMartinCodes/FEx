@@ -38,7 +38,8 @@ fn fixed_drives() -> Vec<String> {
 fn config() -> server::Config {
     let data = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
     let reserve = std::env::var("FEX_RESERVE").ok().and_then(|v| v.parse::<f64>().ok()).map(|p| (p / 100.0).clamp(0.0, 0.5));
-    server::Config { state_dir: data.join("FEx").join("Service"), roots: fixed_drives(), reserve, save_every: Duration::from_secs(600) }
+    let memory_floor = std::env::var("FEX_MEMORY_FLOOR").ok().and_then(|v| v.parse::<f64>().ok()).map_or(crate::memory::DEFAULT_FLOOR, |p| (p / 100.0).clamp(0.0, 0.99));
+    server::Config { state_dir: data.join("FEx").join("Service"), roots: fixed_drives(), reserve, memory_floor, save_every: Duration::from_secs(600) }
 }
 
 /// Release builds have no console of their own: print to the one we were
@@ -111,6 +112,9 @@ pub fn cli(args: &[String]) -> i32 {
                 println!("verified:  {age} s ago");
                 println!("activity:  {}{}", st.activity, if st.paused.is_empty() { String::new() } else { format!(" (paused: {})", st.paused) });
                 println!("cpu:       {}", st.reserve);
+                if !st.memory.is_empty() {
+                    println!("memory:    {}", st.memory);
+                }
                 println!("log:       {}", server::log_path(&config().state_dir).display());
                 0
             }

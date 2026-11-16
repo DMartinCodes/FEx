@@ -176,6 +176,8 @@ pub struct Status {
     pub paused: String,
     /// The CPU reserve and background priority right now.
     pub reserve: String,
+    /// Memory use and the memory level right now.
+    pub memory: String,
 }
 
 pub fn encode_status(st: &Status) -> Vec<u8> {
@@ -189,6 +191,7 @@ pub fn encode_status(st: &Status) -> Vec<u8> {
     put_bytes(&mut out, st.activity.as_bytes());
     put_bytes(&mut out, st.paused.as_bytes());
     put_bytes(&mut out, st.reserve.as_bytes());
+    put_bytes(&mut out, st.memory.as_bytes());
     out
 }
 
@@ -213,5 +216,6 @@ pub fn status() -> io::Result<Status> {
         activity: String::from_utf8_lossy(r.bytes()?).into_owned(),
         paused: String::from_utf8_lossy(r.bytes()?).into_owned(),
         reserve: r.bytes().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default(),
+        memory: r.bytes().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default(),
     })
 }

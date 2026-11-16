@@ -17,7 +17,7 @@ From an elevated prompt:
 
 ```bat
 fex service install      & rem install as FExIndex (LocalSystem, delayed auto start) and start
-fex service status       & rem drives, entries, activity, CPU reserve
+fex service status       & rem drives, entries, activity, CPU reserve, memory
 fex service query report & rem search through the service from the current folder
 fex service profile      & rem the machine profile and CPU reserve
 fex service log          & rem the end of the service's log
@@ -30,7 +30,8 @@ Administrators only): one saved index and journal position per drive, and
 the profile. The log is `%ProgramData%\FEx\service.log`, readable by
 everyone (timings and drive roots, no file names); `fex service log` shows
 its end. Set `FEX_RESERVE` (percent) on the service to override the CPU
-reserve.
+reserve, and `FEX_MEMORY_FLOOR` (percent, default 10) to change when it
+starts giving memory back.
 
 ## How it works
 
@@ -49,6 +50,20 @@ reserve.
   below-normal and normal priority while they get less than the reserve,
   so a machine that is always busy still finishes indexing. Background work
   pauses on battery. Queries and index updates stay at normal priority.
+- **Memory:** the same deal as CPU: use memory freely, give it back before
+  other programs have to. The service runs at below-normal memory priority,
+  so the memory manager trims its pages before normal programs'. Twice a
+  second it reads available memory (the smaller of physical memory and
+  commit charge left) and the OS low-memory notification, and sets a level
+  (shared with Linux, `src/memory.rs`). *Tight* (below the floor, or the OS
+  signals low memory): background work pauses, the heap is compacted and
+  the working set emptied; the pages stay on the standby list, so the next
+  query takes soft faults unless something else needed them. *Critical*
+  (below half the floor): the folder permission cache is dropped too,
+  queries read what they need, and it's read again in the background once
+  memory is normal. Re-applied every 30 s while the level stays up.
+  `fex service status` shows the working set, private bytes, cached folder
+  permissions and the level.
 - **Profile:** cores, memory, battery, and files per NTFS volume (from the
   size of its file table, no crawl); the first crawl replaces the estimate.
 
@@ -91,3 +106,6 @@ reserve.
 4. Run a CPU-bound job on every core during a first crawl: the job should
    lose about the reserve, and the crawl should still progress.
 5. Search in the app: the status bar shows "Index service" on indexed drives.
+6. Set `FEX_MEMORY_FLOOR=99` on the service and restart: `fex service
+   status` should show "paused: memory tight" and the log "memory tight
+   (...): working set A -> B MB"; searches must still answer.

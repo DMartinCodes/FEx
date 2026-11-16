@@ -27,7 +27,15 @@ RuntimeDirectoryMode=0755
 # Its own cgroup lets it tell its I/O stalls from everyone else's (PSI).
 CPUWeight=20
 IOWeight=10
-MemoryHigh=1G
+
+# Memory. The daemon watches available memory and PSI itself and sheds
+# (pauses background work, returns heap, marks or pages out its mapped
+# index) before others are squeezed; see LINUX.md. These are backstops:
+# above MemoryHigh the kernel reclaims from this cgroup first, and if the
+# OOM killer must pick, this goes before interactive programs. A restart
+# reloads the snapshot in milliseconds.
+MemoryHigh=25%
+OOMScoreAdjust=500
 
 # Privileges: read every folder (CAP_DAC_READ_SEARCH, also needed to turn
 # fanotify handles into paths), mark filesystems (CAP_SYS_ADMIN, fanotify

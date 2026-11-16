@@ -77,6 +77,15 @@ impl Mapping {
         Ok(Mapping { ptr: ptr as *const u8, len })
     }
 
+    /// Advise the kernel about the whole mapping (`MADV_COLD`: reclaim these
+    /// pages before others'; `MADV_PAGEOUT`: reclaim them now). Advice an
+    /// older kernel doesn't know is ignored.
+    pub fn advise(&self, advice: libc::c_int) {
+        if self.len > 0 {
+            unsafe { libc::madvise(self.ptr as *mut libc::c_void, self.len, advice) };
+        }
+    }
+
     pub fn bytes(&self) -> &[u8] {
         // SAFETY: `ptr` maps `len` readable bytes for as long as `self` lives.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }

@@ -19,6 +19,11 @@
 //!   traverse bypass, a drive without a journal), workers take on the token
 //!   and open each folder instead. Hidden matches are left out of the count.
 //!   Anything that can't be checked is hidden. SYSTEM clients see everything.
+//! * Memory: the process runs at below-normal memory priority. When memory
+//!   gets tight (`memory.rs`), background work pauses and the service gives
+//!   back what it can: freed heap and its working set (the index pages
+//!   back in on the next query); when critical, the descriptor cache too,
+//!   read again in the background once memory is normal.
 //! * A client's newer query cancels its older ones (search as you type).
 //! * The pipe: created first-instance-only (nobody else can own the name),
 //!   remote clients refused, any authenticated user may connect. A client
@@ -49,7 +54,9 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, ImpersonateNamedPipeClient, PeekNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken, SetThreadToken};
+use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapCompact};
+use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, OpenThreadToken, SetProcessWorkingSetSize, SetThreadToken};
 
 use super::access::{self, Descriptors, Sd};
 use super::profile::{self, Profile};
@@ -58,6 +65,7 @@ use super::throttle::{self, Throttle};
 use super::usn::{self, CatchUp, Polled};
 use crate::fsys::{self, Row, SortKey};
 use crate::index::{self, Build, Everything, Freshness, Hooks, Index, Live, Matcher, Visibility};
+use crate::memory::Level;
 use crate::wire::{self, put_bytes, put_u32, put_u64, Reader};
 
 pub struct Config {
@@ -66,6 +74,8 @@ pub struct Config {
     pub roots: Vec<String>,
     /// CPU share reserved under full load, overriding the profile's.
     pub reserve: Option<f64>,
+    /// Available memory (fraction) below which the service gives memory back.
+    pub memory_floor: f64,
     pub save_every: Duration,
 }
 
@@ -219,13 +229,14 @@ pub fn run(cfg: Config, ready: impl FnOnce()) {
         }
     };
     log(&format!("profile: {}", profile.describe()));
+    throttle::lower_memory_priority();
     let sh = Arc::new(Shared {
         drives: cfg
             .roots
             .iter()
             .map(|r| Drive { root: r.clone(), tracked: AtomicBool::new(false), caught_up: AtomicBool::new(false), live: RwLock::new(None), stale: Arc::new(AtomicBool::new(false)), last_save: Mutex::new(Instant::now()) })
             .collect(),
-        throttle: Throttle::start(cfg.reserve.unwrap_or(profile.reserve), profile.cores),
+        throttle: Throttle::start(cfg.reserve.unwrap_or(profile.reserve), profile.cores, cfg.memory_floor),
         sds: Descriptors::default(),
         clients: Mutex::new(HashMap::new()),
         own: Arc::from([cfg.state_dir.parent().unwrap_or(&cfg.state_dir).to_string_lossy().into_owned()]),
@@ -237,6 +248,10 @@ pub fn run(cfg: Config, ready: impl FnOnce()) {
     {
         let sh = sh.clone();
         thread::Builder::new().name("fex-permissions".into()).spawn(move || follow_permissions(&sh)).ok();
+    }
+    {
+        let sh = sh.clone();
+        thread::Builder::new().name("fex-memory".into()).spawn(move || watch_memory(&sh)).ok();
     }
     let maint = {
         let sh = sh.clone();
@@ -444,7 +459,9 @@ fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
     }
     while !STOP.load(Relaxed) {
         thread::sleep(Duration::from_secs(1));
-        if sh.sds.take_cleared() {
+        // Refill a cleared cache only once memory is normal (a shed under
+        // critical memory clears it; queries meanwhile read what they need).
+        if sh.throttle.memory_level() == Level::Normal && sh.sds.take_cleared() {
             prefetch_descriptors(sh);
             sh.set_activity("idle");
         }
@@ -467,6 +484,75 @@ fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
             }
         }
     }
+}
+
+/// Shed memory when the level rises, and again every 30 s while it stays up
+/// (what was freed may have been refilled since).
+fn watch_memory(sh: &Shared) {
+    let mut was = Level::Normal;
+    let mut last = Instant::now();
+    while !STOP.load(Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+        let level = sh.throttle.memory_level();
+        if level > was || (level != Level::Normal && last.elapsed() >= Duration::from_secs(30)) {
+            shed(sh, level);
+            last = Instant::now();
+        }
+        was = level;
+    }
+}
+
+/// Give memory back (background work already pauses while it's tight).
+/// Tight: compact the heap (free blocks decommitted) and empty the working
+/// set; pages stay on the standby list, so a query soon after takes soft
+/// faults, not disk reads, unless something else needed the memory.
+/// Critical: also drop the descriptor cache.
+fn shed(sh: &Shared, level: Level) {
+    let before = process_memory();
+    let mut dropped = 0;
+    if level == Level::Critical {
+        dropped = sh.sds.folders();
+        sh.sds.clear();
+    }
+    unsafe {
+        HeapCompact(GetProcessHeap(), 0);
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+    let after = process_memory();
+    let mb = |b: u64| b as f64 / 1048576.0;
+    log(&format!(
+        "memory {} ({:.0}% available): working set {:.1} -> {:.1} MB, private {:.1} -> {:.1} MB{}",
+        level.name(),
+        sh.throttle.memory_available() * 100.0,
+        mb(before.0),
+        mb(after.0),
+        mb(before.1),
+        mb(after.1),
+        if dropped > 0 { format!("; dropped {dropped} cached folder permissions") } else { String::new() }
+    ));
+}
+
+/// (working set, private bytes) of this process.
+fn process_memory() -> (u64, u64) {
+    let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    c.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb) } == 0 {
+        return (0, 0);
+    }
+    (c.WorkingSetSize as u64, c.PrivateUsage as u64)
+}
+
+fn memory_state(sh: &Shared) -> String {
+    let (ws, private) = process_memory();
+    let mb = |b: u64| b as f64 / 1048576.0;
+    format!(
+        "{:.1} MB working set, {:.1} MB private, {} cached folder permissions · {} ({:.0}% of memory available)",
+        mb(ws),
+        mb(private),
+        sh.sds.folders(),
+        sh.throttle.memory_level().name(),
+        sh.throttle.memory_available() * 100.0
+    )
 }
 
 /// Read every indexed folder's security descriptor ahead of the first
@@ -860,6 +946,7 @@ fn serve(sh: &Shared, pipe: &File) {
                 activity: sh.activity.lock().unwrap_or_else(PoisonError::into_inner).to_string(),
                 paused: sh.throttle.paused().unwrap_or_default(),
                 reserve: sh.throttle.reserve_state(),
+                memory: memory_state(sh),
                 ..Default::default()
             };
             for d in &sh.drives {

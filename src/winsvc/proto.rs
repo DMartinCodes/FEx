@@ -184,6 +184,8 @@ pub struct Status {
     pub activity: String,
     pub paused: String,
     pub reserve: String,
+    /// Memory use and the memory level right now.
+    pub memory: String,
 }
 
 impl Status {
@@ -198,7 +200,7 @@ pub fn encode_status(st: &Status) -> Vec<u8> {
     put_bytes(&mut out, st.ready.join("\n").as_bytes());
     put_u64(&mut out, st.entries);
     put_u64(&mut out, st.verified_ns);
-    for s in [&st.activity, &st.paused, &st.reserve] {
+    for s in [&st.activity, &st.paused, &st.reserve, &st.memory] {
         put_bytes(&mut out, s.as_bytes());
     }
     out
@@ -222,5 +224,6 @@ pub fn status() -> io::Result<Status> {
         activity: text(r.bytes()?),
         paused: text(r.bytes()?),
         reserve: text(r.bytes()?),
+        memory: r.bytes().map(text).unwrap_or_default(),
     })
 }

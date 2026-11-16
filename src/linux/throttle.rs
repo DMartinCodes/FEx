@@ -24,10 +24,12 @@
 
 use std::cell::Cell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
+
+use crate::memory;
 
 /// Background priority steps: `SCHED_IDLE`, then these nice values.
 const NICE_STEPS: [i32; 5] = [19, 15, 10, 5, 0];
@@ -95,6 +97,14 @@ fn own_cgroup() -> Option<PathBuf> {
     (path != "/").then(|| PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/')))
 }
 
+/// MemAvailable / MemTotal from /proc/meminfo.
+fn available_fraction() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.trim().trim_end_matches("kB").trim().parse::<f64>().ok());
+    let (total, available) = (field("MemTotal:")?, field("MemAvailable:")?);
+    (total > 0.0).then(|| available / total)
+}
+
 /// True when the machine has mains power supplies and none is online.
 fn on_battery() -> bool {
     let Ok(dir) = std::fs::read_dir("/sys/class/power_supply") else { return false };
@@ -113,6 +123,11 @@ fn on_battery() -> bool {
 
 pub struct Throttle {
     paused: AtomicBool,
+    /// Memory level (`memory::Level`), and available memory (ppm of total).
+    mem_level: AtomicU8,
+    mem_available_ppm: AtomicU64,
+    /// Below this fraction of memory available, give memory back.
+    memory_floor: f64,
     /// Shutting down: nothing waits for a pause to end any more.
     stopping: AtomicBool,
     reason: Mutex<String>,
@@ -135,9 +150,12 @@ pub struct Throttle {
 
 impl Throttle {
     /// The state alone, with no monitor threads (`start` adds them).
-    fn new(io_limit: f64, reserve: f64, cores: usize, own_cgroup: bool) -> Throttle {
+    fn new(io_limit: f64, reserve: f64, cores: usize, own_cgroup: bool, memory_floor: f64) -> Throttle {
         Throttle {
             paused: AtomicBool::new(false),
+            mem_level: AtomicU8::new(0),
+            mem_available_ppm: AtomicU64::new(1_000_000),
+            memory_floor,
             stopping: AtomicBool::new(false),
             reason: Mutex::new(String::new()),
             io_limit,
@@ -153,9 +171,9 @@ impl Throttle {
 
     /// Start watching pressure and power every half second, and enforce
     /// `reserve` (a share of total CPU capacity across `cores`) every 100 ms.
-    pub fn start(io_limit: f64, reserve: f64, cores: usize) -> Arc<Throttle> {
+    pub fn start(io_limit: f64, reserve: f64, cores: usize, memory_floor: f64) -> Arc<Throttle> {
         let cgroup = own_cgroup();
-        let t = Arc::new(Throttle::new(io_limit, reserve, cores, cgroup.is_some()));
+        let t = Arc::new(Throttle::new(io_limit, reserve, cores, cgroup.is_some(), memory_floor));
         let w = Arc::downgrade(&t);
         thread::Builder::new()
             .name("fex-reserve".into())
@@ -195,17 +213,25 @@ impl Throttle {
         let system = psi_some("/proc/pressure/io".as_ref()).unwrap_or(0.0);
         let own = cgroup.and_then(|c| psi_some(&c.join("io.pressure"))).unwrap_or(0.0);
         let others = (system - own).max(0.0);
-        let memory = psi_some("/proc/pressure/memory".as_ref()).unwrap_or(0.0);
+        // Memory: others' stalls (our own cgroup's subtracted, as for I/O, so
+        // the daemon doesn't back off from pressure it causes) and how much
+        // is available.
+        let mem_system = psi_some("/proc/pressure/memory".as_ref()).unwrap_or(0.0);
+        let mem_own = cgroup.and_then(|c| psi_some(&c.join("memory.pressure"))).unwrap_or(0.0);
+        let reading = memory::Reading { available: available_fraction().unwrap_or(1.0), stall: (mem_system - mem_own).max(0.0), low: false };
+        let mem_level = memory::level(self.memory_level(), &reading, self.memory_floor);
+        self.mem_level.store(mem_level as u8, Relaxed);
+        self.mem_available_ppm.store((reading.available * 1e6) as u64, Relaxed);
         let battery = on_battery();
         let was = self.paused.load(Relaxed);
         // Hysteresis: resume only well below the limits.
-        let (io, mem) = if was { (self.io_limit / 2.0, 5.0) } else { (self.io_limit, 10.0) };
+        let io = if was { self.io_limit / 2.0 } else { self.io_limit };
         let why = if battery {
             Some("on battery".to_string())
         } else if others > io {
             Some(format!("I/O pressure {others:.0}%"))
-        } else if memory > mem {
-            Some(format!("memory pressure {memory:.0}%"))
+        } else if mem_level != memory::Level::Normal {
+            Some(format!("memory {} ({:.0}% available)", mem_level.name(), reading.available * 100.0))
         } else {
             None
         };
@@ -230,6 +256,15 @@ impl Throttle {
             thread::sleep(Duration::from_millis(250));
             LAST_CPU.with(|c| c.set(thread_cpu_ns()));
         }
+    }
+
+    pub fn memory_level(&self) -> memory::Level {
+        memory::Level::from_u8(self.mem_level.load(Relaxed))
+    }
+
+    /// Available memory as a fraction of total, at the last check.
+    pub fn memory_available(&self) -> f64 {
+        self.mem_available_ppm.load(Relaxed) as f64 / 1e6
     }
 
     /// Release paused threads for good, so they reach their cancel checks
@@ -268,7 +303,7 @@ mod tests {
 
     #[test]
     fn stop_releases_paused_threads() {
-        let t = Arc::new(Throttle::new(10.0, 0.0, 1, false));
+        let t = Arc::new(Throttle::new(10.0, 0.0, 1, false, memory::DEFAULT_FLOOR));
         t.paused.store(true, Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
         let t2 = t.clone();

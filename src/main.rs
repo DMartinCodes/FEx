@@ -23,6 +23,7 @@ mod oledrag;
 mod oledrop;
 #[cfg(windows)]
 mod ops;
+mod memory;
 mod pool;
 #[cfg(windows)]
 mod props;

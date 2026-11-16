@@ -9,20 +9,29 @@
 //!   the reserve (`reserve.rs`), steps them out of background mode through
 //!   LOWEST, BELOW_NORMAL and NORMAL priority; back down once they get enough.
 //! * Power: on battery, background work pauses.
+//! * Memory (`memory.rs`): available physical memory and commit, plus the
+//!   OS's low-memory notification, set a level; background work pauses
+//!   while it isn't normal, and the server sheds (heap, working set, the
+//!   descriptor cache). The whole process runs at below-normal memory
+//!   priority, so its pages are trimmed before other programs'.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::FILETIME;
+use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
+use windows_sys::Win32::System::Memory::{CreateMemoryResourceNotification, LowMemoryResourceNotification, QueryMemoryResourceNotification};
 use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentThread, GetThreadTimes, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END, THREAD_PRIORITY,
-    THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+    GetCurrentProcess, GetCurrentThread, GetThreadTimes, ProcessMemoryPriority, SetProcessInformation, SetThreadPriority, MEMORY_PRIORITY_BELOW_NORMAL,
+    MEMORY_PRIORITY_INFORMATION, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END, THREAD_PRIORITY, THREAD_PRIORITY_BELOW_NORMAL,
+    THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
 };
 
+use crate::memory::{self, Level};
 use crate::reserve;
 
 /// Priorities above background mode, in the order the controller raises.
@@ -72,8 +81,44 @@ fn on_battery() -> bool {
     unsafe { GetSystemPowerStatus(&mut st) != 0 && st.ACLineStatus == 0 }
 }
 
+/// Give the whole process below-normal memory priority: under pressure the
+/// memory manager trims its pages (and repurposes its standby pages) before
+/// those of normal programs. Queries are unaffected while memory is ample.
+pub fn lower_memory_priority() {
+    let info = MEMORY_PRIORITY_INFORMATION { MemoryPriority: MEMORY_PRIORITY_BELOW_NORMAL };
+    unsafe { SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, (&raw const info).cast(), size_of::<MEMORY_PRIORITY_INFORMATION>() as u32) };
+}
+
+/// The OS's low-memory signal (a handle that lives as long as the process;
+/// 0 if it couldn't be made).
+fn low_memory_handle() -> usize {
+    unsafe { CreateMemoryResourceNotification(LowMemoryResourceNotification) as usize }
+}
+
+/// One look at memory. Available is the smaller of the physical memory and
+/// the commit charge left, as fractions: running out of either hurts other
+/// programs (paging, or allocations failing). Windows has no PSI, so the
+/// OS's own low-memory signal stands in for stalls.
+fn memory_reading(low_handle: usize) -> Option<memory::Reading> {
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullTotalPhys == 0 {
+        return None;
+    }
+    let phys = m.ullAvailPhys as f64 / m.ullTotalPhys as f64;
+    let commit = if m.ullTotalPageFile > 0 { m.ullAvailPageFile as f64 / m.ullTotalPageFile as f64 } else { 1.0 };
+    let mut state = 0;
+    let low = low_handle != 0 && unsafe { QueryMemoryResourceNotification(low_handle as HANDLE, &mut state) } != 0 && state != 0;
+    Some(memory::Reading { available: phys.min(commit), stall: 0.0, low })
+}
+
 pub struct Throttle {
+    /// Background work waits: on battery, or memory isn't normal.
     paused: AtomicBool,
+    battery: AtomicBool,
+    mem_level: AtomicU8,
+    mem_available_ppm: AtomicU64,
+    memory_floor: f64,
     /// Shutting down: nothing waits for a pause to end any more.
     stopping: AtomicBool,
     reserve: AtomicU64,
@@ -87,9 +132,13 @@ pub struct Throttle {
 
 impl Throttle {
     /// The state alone, with no monitor thread (`start` adds it).
-    fn new(reserve: f64, cores: usize) -> Throttle {
+    fn new(reserve: f64, cores: usize, memory_floor: f64) -> Throttle {
         Throttle {
             paused: AtomicBool::new(false),
+            battery: AtomicBool::new(false),
+            mem_level: AtomicU8::new(Level::Normal as u8),
+            mem_available_ppm: AtomicU64::new(1_000_000),
+            memory_floor,
             stopping: AtomicBool::new(false),
             reserve: AtomicU64::new(reserve.to_bits()),
             cores: cores.max(1),
@@ -101,9 +150,10 @@ impl Throttle {
         }
     }
 
-    pub fn start(reserve: f64, cores: usize) -> Arc<Throttle> {
-        let t = Arc::new(Throttle::new(reserve, cores));
+    pub fn start(reserve: f64, cores: usize, memory_floor: f64) -> Arc<Throttle> {
+        let t = Arc::new(Throttle::new(reserve, cores, memory_floor));
         let w = Arc::downgrade(&t);
+        let low = low_memory_handle();
         thread::Builder::new()
             .name("fex-reserve".into())
             .spawn(move || {
@@ -118,7 +168,11 @@ impl Throttle {
                     let step = reserve::next_step(t.step.load(Relaxed), ewma, t.reserve(), active, STEPS.len());
                     t.step.store(step, Relaxed);
                     if ticks % 5 == 0 {
-                        t.paused.store(on_battery(), Relaxed);
+                        t.battery.store(on_battery(), Relaxed);
+                        if let Some(r) = memory_reading(low) {
+                            t.observe_memory(&r);
+                        }
+                        t.paused.store(t.battery.load(Relaxed) || t.memory_level() != Level::Normal, Relaxed);
                     }
                     ticks = ticks.wrapping_add(1);
                     drop(t);
@@ -127,6 +181,21 @@ impl Throttle {
             })
             .ok();
         t
+    }
+
+    fn observe_memory(&self, r: &memory::Reading) {
+        let level = memory::level(self.memory_level(), r, self.memory_floor);
+        self.mem_level.store(level as u8, Relaxed);
+        self.mem_available_ppm.store((r.available * 1e6) as u64, Relaxed);
+    }
+
+    pub fn memory_level(&self) -> Level {
+        Level::from_u8(self.mem_level.load(Relaxed))
+    }
+
+    /// Available memory (the smaller of physical and commit), 0..1.
+    pub fn memory_available(&self) -> f64 {
+        self.mem_available_ppm.load(Relaxed) as f64 / 1e6
     }
 
     fn now_ns(&self) -> u64 {
@@ -168,7 +237,13 @@ impl Throttle {
     }
 
     pub fn paused(&self) -> Option<String> {
-        self.paused.load(Relaxed).then(|| "on battery".to_string())
+        if self.battery.load(Relaxed) {
+            Some("on battery".to_string())
+        } else if self.memory_level() != Level::Normal {
+            Some(format!("memory {} ({:.0}% available)", self.memory_level().name(), self.memory_available() * 100.0))
+        } else {
+            None
+        }
     }
 
     pub fn reserve_state(&self) -> String {
@@ -187,7 +262,7 @@ mod tests {
 
     #[test]
     fn stop_releases_paused_threads() {
-        let t = Arc::new(Throttle::new(0.0, 1));
+        let t = Arc::new(Throttle::new(0.0, 1, memory::DEFAULT_FLOOR));
         t.paused.store(true, Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
         let t2 = t.clone();
@@ -198,5 +273,15 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(800)).is_err(), "a paused wait must block");
         t.stop();
         assert!(rx.recv_timeout(Duration::from_secs(3)).is_ok(), "stop must release it");
+    }
+
+    #[test]
+    fn memory_reading_is_sane() {
+        let r = memory_reading(low_memory_handle()).expect("GlobalMemoryStatusEx");
+        assert!(r.available > 0.0 && r.available <= 1.0, "{r:?}");
+        let t = Throttle::new(0.0, 1, 0.99);
+        t.observe_memory(&r);
+        assert_ne!(t.memory_level(), Level::Normal, "a 99% floor must read as tight");
+        assert!(t.paused().is_some_and(|p| p.starts_with("memory")));
     }
 }

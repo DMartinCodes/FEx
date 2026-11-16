@@ -27,7 +27,7 @@ use eframe::egui;
 
 const USAGE: &str = "usage: fex [folder]
        fex daemon [--root /] [--state-dir /var/lib/fex] [--socket PATH] [--workers N]
-                  [--sweep-every SECS] [--save-every SECS] [--io-limit PCT] [--reserve PCT]
+                  [--sweep-every SECS] [--save-every SECS] [--io-limit PCT] [--reserve PCT] [--memory-floor PCT]
                   [--no-fanotify] [--include-network]
        fex query [--regex] [--scope DIR] [--limit N] [--show N] <text>
        fex status
@@ -281,6 +281,7 @@ fn cli_daemon(args: &[String]) -> ExitCode {
         workers: walk::cores(),
         io_limit: 10.0,
         reserve: None,
+        memory_floor: crate::memory::DEFAULT_FLOOR,
     };
     let mut it = args.iter();
     let parsed: Result<(), String> = (|| {
@@ -294,6 +295,10 @@ fn cli_daemon(args: &[String]) -> ExitCode {
                 "--save-every" => cfg.save_every = secs(arg_value(&mut it, a)?)?,
                 "--workers" => cfg.workers = arg_value(&mut it, a)?.parse().map_err(|_| "--workers: expected a number")?,
                 "--io-limit" => cfg.io_limit = arg_value(&mut it, a)?.parse().map_err(|_| "--io-limit: expected a percentage")?,
+                "--memory-floor" => {
+                    let pct: f64 = arg_value(&mut it, a)?.parse().map_err(|_| "--memory-floor: expected a percentage")?;
+                    cfg.memory_floor = (pct / 100.0).clamp(0.0, 0.99);
+                }
                 "--reserve" => {
                     let pct: f64 = arg_value(&mut it, a)?.parse().map_err(|_| "--reserve: expected a percentage")?;
                     cfg.reserve = Some((pct / 100.0).clamp(0.0, 0.5));
@@ -383,12 +388,15 @@ fn cli_status() -> ExitCode {
                 .unwrap_or(0);
             println!("root:      {}", String::from_utf8_lossy(&st.root));
             println!("index:     {}", if st.ready { format!("{} entries, {} folders (generation {})", st.entries, st.dirs, st.generation) } else { "being built".into() });
-            println!("memory:    {:.1} MB mapped snapshot + {:.1} MB heap", st.mapped_bytes as f64 / 1048576.0, st.heap_bytes as f64 / 1048576.0);
+            println!("index data: {:.1} MB mapped snapshot + {:.1} MB heap", st.mapped_bytes as f64 / 1048576.0, st.heap_bytes as f64 / 1048576.0);
             println!("verified:  {age} s ago");
             println!("watching:  {}", if st.watched > 0 { format!("{} filesystem(s) with fanotify", st.watched) } else { "periodic sweeps only".into() });
             println!("activity:  {}{}", st.activity, if st.paused.is_empty() { String::new() } else { format!(" (paused: {})", st.paused) });
             if !st.reserve.is_empty() {
                 println!("cpu:       {}", st.reserve);
+            }
+            if !st.memory.is_empty() {
+                println!("memory:    {}", st.memory);
             }
             ExitCode::SUCCESS
         }
@@ -614,7 +622,7 @@ fn bench_interference(args: &[String]) -> ExitCode {
             if let Some(reserve) = crawler {
                 sc.spawn(move || {
                     let idle = reserve >= 0.0;
-                    let t = throttle::Throttle::start(f64::INFINITY, reserve.max(0.0), cores);
+                    let t = throttle::Throttle::start(f64::INFINITY, reserve.max(0.0), cores, 0.0);
                     let pace = || t.wait();
                     let init: &(dyn Fn() + Sync) = if idle { &throttle::background_thread } else { &|| {} };
                     let pace: &(dyn Fn() + Sync) = if idle { &pace } else { &|| {} };
