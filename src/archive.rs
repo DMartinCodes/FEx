@@ -203,12 +203,24 @@ fn check_space(destination: &Path, needed: u64) -> Result<(), String> {
 
 /// Write one member to a new file, stopping if it inflates past its declared
 /// size. `zone` is the archive's Mark of the Web, passed on to the file.
+/// If the name is taken (members whose names differ only in case, common in
+/// archives made on Linux, or a member listed twice), the file gets a
+/// numbered name instead of failing the whole extraction.
 fn write_entry(entry: &mut impl Read, declared: u64, mtime: u64, zone: Option<&[u8]>, target: &Path) -> Result<(), String> {
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .map_err(|e| format!("{}: {e}", target.display()))?;
+    let mut target = target.to_path_buf();
+    let mut opened = OpenOptions::new().write(true).create_new(true).open(&target);
+    for _ in 0..16 {
+        let Err(e) = &opened else { break };
+        if e.kind() != io::ErrorKind::AlreadyExists {
+            break;
+        }
+        let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else { break };
+        let alternative = dir.join(ops::unique_name(&dir.to_string_lossy(), &name.to_string_lossy(), false));
+        opened = OpenOptions::new().write(true).create_new(true).open(&alternative);
+        target = alternative;
+    }
+    let target = target.as_path();
+    let mut output = opened.map_err(|e| format!("{}: {e}", target.display()))?;
     let written = io::copy(&mut entry.take(declared.saturating_add(1)), &mut output);
     let result = match written {
         Ok(n) if n > declared => Err(format!("{}: archive entry is larger than it declares", target.display())),
@@ -502,6 +514,28 @@ mod tests {
         let (again, _) = extract_members(&picks[1..], &out_s);
         assert!(again[0].ends_with("root (2).txt"), "{again:?}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extracts_members_whose_names_differ_only_in_case() {
+        let root = std::env::temp_dir().join(format!("fex-archive-case-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("case.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("src/Makefile", options).unwrap();
+        writer.write_all(b"upper").unwrap();
+        writer.start_file("src/makefile", options).unwrap();
+        writer.write_all(b"lower").unwrap();
+        writer.finish().unwrap();
+
+        let destination = extract_archive(&archive_path.to_string_lossy()).unwrap();
+        let src = Path::new(&destination).join("src");
+        assert_eq!(fs::read(src.join("Makefile")).unwrap(), b"upper");
+        assert_eq!(fs::read(src.join("makefile (2)")).unwrap(), b"lower");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(destination);
     }
 
     #[test]

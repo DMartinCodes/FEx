@@ -18,7 +18,11 @@
 //! ```
 //! Before sending anything, the client checks that the pipe belongs to
 //! SYSTEM or the Administrators group, so another user can't stand in for
-//! the service (by creating the pipe first) and read the queries.
+//! the service (by creating the pipe first) and read the queries, and, when
+//! the service is running, that the process serving this connection is the
+//! service itself. (The pipe's ACL doesn't let users add instances of their
+//! own, and every instance shares the first one's owner, so the owner check
+//! alone couldn't tell a rogue instance apart.)
 
 use std::fs::File;
 use std::io;
@@ -29,7 +33,7 @@ use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_PIPE_BUSY, G
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION, PSID};
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
-use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
 
 use crate::fsys::Row;
 use crate::wire::{self, put_bytes, put_u32, put_u64, Reader};
@@ -49,6 +53,9 @@ pub const NAME_DESC: u8 = 1;
 pub const UNORDERED: u8 = 2;
 
 pub const MAX_REQUEST: usize = 64 * 1024;
+/// Largest reply message a client accepts: real chunks are a few MB, so a
+/// larger length means a broken or hostile server, not a reason to allocate.
+const MAX_REPLY: usize = 256 << 20;
 pub const MAX_LIMIT: u32 = 250_000;
 
 /// Allow the service to impersonate the client (for its access checks).
@@ -72,6 +79,15 @@ fn owned_by_service(h: HANDLE) -> bool {
     ok
 }
 
+/// Whether this connection's server process is the running index service.
+/// When the service isn't running (`fex service debug`), only the owner
+/// check applies.
+fn served_by_service(h: HANDLE) -> bool {
+    let Some(service) = super::scm::running_pid() else { return true };
+    let mut server = 0u32;
+    unsafe { GetNamedPipeServerProcessId(h, &mut server) != 0 && server == service }
+}
+
 fn connect() -> io::Result<File> {
     let name = wide(PIPE);
     for attempt in 0..2 {
@@ -83,6 +99,9 @@ fn connect() -> io::Result<File> {
             let f = unsafe { File::from_raw_handle(h) };
             if !owned_by_service(f.as_raw_handle()) {
                 return Err(io::Error::other("the index pipe isn't owned by the service"));
+            }
+            if !served_by_service(f.as_raw_handle()) {
+                return Err(io::Error::other("the index pipe isn't served by the FEx index service"));
             }
             return Ok(f);
         }
@@ -141,7 +160,7 @@ impl Stream {
     /// The next chunk, or `None` once the reply is complete.
     pub fn next(&mut self) -> io::Result<Option<Vec<Row>>> {
         let Some(p) = self.pipe.as_mut() else { return Ok(None) };
-        let body = wire::recv(p, usize::MAX >> 1)?;
+        let body = wire::recv(p, MAX_REPLY)?;
         self.chunk(&body, false).map(Some)
     }
 }
@@ -157,7 +176,7 @@ pub fn query(scope: &str, text: &str, regex: bool, limit: u32, order: u8, first:
     put_u32(&mut req, first);
     put_u64(&mut req, seq);
     wire::send(&mut p, &req)?;
-    let body = wire::recv(&mut p, usize::MAX >> 1)?;
+    let body = wire::recv(&mut p, MAX_REPLY)?;
     let mut r = Reader::new(&body);
     let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
     match r.u8()? {
