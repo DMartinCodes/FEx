@@ -1,6 +1,24 @@
 # FEx
-A file explorer that tries to be faster
+FEx (File EXplorer or File Explorer Xtreme, depending on your mood) is a cross-platform filesystem browser primarily intended to offer a more expedient experience for finding files on your computer and network drives.
 
+FEx runs a background indexing service to build an in-memory table of file indices, which the frontend then queries. This allows FEx to return search results much faster than the built-in Windows file explorer. 
+
+The indexing service is configured to use system resources greedily *only when your CPU is idle*, which lets FEx give rapid responses without impairing the functionality of other programs.
+
+Currently, FEx has builds for both Windows and Linux, and while I am working to have both clients enjoy feature parity, there may be deltas between the two. 
+
+## Installing on Windows
+Download ```fex-[TARGET VERSION]-windows-x64.zip```
+
+From an elevated command prompt in the extracted folder, run:
+
+```./fex service install```
+
+You can dynamically tune resource consumption based on system hardware with ```./fex service profile```
+
+The FEx exe file can then be pinned to your taskbar or launched from any folder.
+
+Starting with v0.1.0, you can use ```./fex update check``` and ```./fex update``` to update the frontend and indexing service without rebuilding index memory.
 
 
 ## Installing on Linux
