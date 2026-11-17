@@ -44,6 +44,9 @@ const REQUERY_DELAY: Duration = Duration::from_millis(400);
 /// An index rebuilt more recently than this is kept when changes are lost.
 const STALE_GRACE: Duration = Duration::from_secs(60);
 const ROW_H: f32 = 22.0;
+/// Blank rows kept after the last item, so a full folder still has empty
+/// space to right-click (New, Paste) or start a selection box from.
+const BLANK_ROWS: usize = 3;
 const RED: Color32 = Color32::from_rgb(230, 80, 80);
 /// Pseudo-location for the network page (shown in the path bar and history).
 const NETWORK: &str = "Network";
@@ -62,7 +65,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
     ("F2", "Rename"),
     ("Del, Shift+Del", "Recycle, delete permanently"),
-    ("Ctrl+Shift+N", "New folder (right-click for other new items)"),
+    ("Ctrl+Shift+N", "New folder"),
+    ("Ctrl+Alt+N", "New text file (right-click empty space or ➕ for other types)"),
     ("Alt+Enter", "Properties"),
     ("Ctrl+A", "Select all"),
     ("", ""),
@@ -156,6 +160,8 @@ enum Action {
     /// Properties of the open folder itself.
     FolderProperties,
     NewFolder,
+    /// An empty text file (Ctrl+Alt+N).
+    NewFile,
     /// Create a file from the ShellNew template at this index.
     NewItem(usize),
     LoadShellNew,
@@ -1174,6 +1180,18 @@ impl FexApp {
         }
     }
 
+    /// A new empty text file, named like Explorer's, then rename it.
+    fn new_file(&mut self) {
+        if self.cwd == RECENT || self.cwd == NETWORK || archive::is_location(&self.cwd) || fsys::is_server_root(&self.cwd) {
+            return;
+        }
+        let dir = self.cwd.clone();
+        self.spawn_io(move || Some(match crate::shellnew::create(&dir, &crate::shellnew::Item::text_document()) {
+            Ok(name) => Msg::Created { dir, name },
+            Err(error) => Msg::Error(error),
+        }));
+    }
+
     fn load_shell_new_items(&mut self) {
         if self.shell_new_loading || self.shell_new_items.is_some() {
             return;
@@ -1992,6 +2010,9 @@ impl FexApp {
         if pressed(Modifiers::CTRL | Modifiers::SHIFT, Key::N) {
             self.new_folder();
         }
+        if pressed(Modifiers::CTRL | Modifiers::ALT, Key::N) {
+            self.new_file();
+        }
         if pressed(Modifiers::NONE, Key::F2) {
             if let Some(i) = self.focus.filter(|&i| self.row(i).is_some_and(|r| r.sel)) {
                 self.begin_rename(i);
@@ -2067,6 +2088,14 @@ impl FexApp {
             if nav(ui, can_go_up, "⬆", "Up (Alt+↑)") {
                 self.go_up();
             }
+            let writable = self.cwd != RECENT && self.cwd != NETWORK && !archive::is_location(&self.cwd) && !fsys::is_server_root(&self.cwd);
+            let mut new_action = None;
+            ui.add_enabled_ui(writable, |ui| {
+                ui.menu_button("➕", |ui| self.new_menu(ui, &mut new_action))
+                    .response
+                    .on_hover_text("New folder or file (Ctrl+Shift+N, Ctrl+Alt+N)");
+            });
+            self.run_action(new_action, ui);
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.menu_button("☰", |ui| self.main_menu(ui));
@@ -2818,8 +2847,20 @@ impl FexApp {
         let mut row_zones = Vec::new();
 
         ui.spacing_mut().item_spacing.y = 0.0;
-        let out = area.show_rows(ui, ROW_H, self.view.len(), |ui, range| {
+        let out = area.show_rows(ui, ROW_H, self.view.len() + BLANK_ROWS, |ui, range| {
             for vi in range {
+                if vi >= self.view.len() {
+                    // Trailing blank row: behaves like the empty space below.
+                    let (_, resp) = ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::click_and_drag());
+                    if resp.clicked() {
+                        action = Some(Action::ClearSelection);
+                    } else if resp.drag_started_by(PointerButton::Primary) {
+                        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(resp.rect.left_top());
+                        action = Some(Action::StartBand { origin, additive: mods.ctrl });
+                    }
+                    self.background_menu(&resp, &mut action);
+                    continue;
+                }
                 let Some(row) = self.row(vi) else { continue };
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::click_and_drag());
                 let selected = row.sel;
@@ -3019,6 +3060,10 @@ impl FexApp {
     fn new_menu(&self, ui: &mut Ui, action: &mut Option<Action>) {
         if ui.add(Button::new("Folder").shortcut_text("Ctrl+Shift+N")).clicked() {
             *action = Some(Action::NewFolder);
+            ui.close();
+        }
+        if ui.add(Button::new("Text file").shortcut_text("Ctrl+Alt+N")).clicked() {
+            *action = Some(Action::NewFile);
             ui.close();
         }
         ui.separator();
@@ -3226,6 +3271,7 @@ impl FexApp {
                 self.open_properties();
             }
             Action::NewFolder => self.new_folder(),
+            Action::NewFile => self.new_file(),
             Action::NewItem(index) => self.create_shell_new_item(index),
             Action::LoadShellNew => self.load_shell_new_items(),
             Action::Undo => self.undo(),
@@ -3800,7 +3846,8 @@ impl eframe::App for FexApp {
             egui::Panel::top("elevated").show(ui, |ui| {
                 ui.colored_label(
                     RED,
-                    "⚠ FEx is running as administrator: nothing you do here will ask for UAC approval. \
+                    "⚠ FEx is running as administrator: nothing you do here will ask for UAC approval, and \
+                     Windows blocks dragging files in from Explorer and other normal programs. \
                      Unless you need that, close it and start FEx normally.",
                 );
             });
