@@ -2828,7 +2828,8 @@ impl FexApp {
         if let Some(i) = self.scroll_to.take() {
             let top = i as f32 * ROW_H;
             let mut y = self.scroll_y;
-            if top < y {
+            // Before the first frame has measured the list, show the row at the top.
+            if top < y || self.view_h <= 0.0 {
                 y = top;
             } else if top + ROW_H > y + self.view_h {
                 y = top + ROW_H - self.view_h;
