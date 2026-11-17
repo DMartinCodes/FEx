@@ -43,6 +43,9 @@ const TYPEAHEAD_RESET: Duration = Duration::from_millis(1200);
 /// Hovering a dragged item on a tab this long switches to it.
 const TAB_SPRING: Duration = Duration::from_millis(600);
 const ROW_H: f32 = 22.0;
+/// Blank rows kept after the last item, so a full folder still has empty
+/// space to right-click (New, Paste) or start a selection box from.
+const BLANK_ROWS: usize = 3;
 const RED: egui::Color32 = egui::Color32::from_rgb(230, 80, 80);
 /// How often volumes are re-listed even without a mount change (GVFS
 /// shares come and go without one), and free space is re-read.
@@ -65,7 +68,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
     ("F2", "Rename"),
     ("Del, Shift+Del", "Move to trash, delete permanently"),
-    ("Ctrl+Shift+N", "New folder (right-click for other new items)"),
+    ("Ctrl+Shift+N", "New folder"),
+    ("Ctrl+Alt+N", "New text file (right-click empty space or ➕ for other types)"),
     ("Alt+Enter", "Properties"),
     ("Ctrl+A", "Select all"),
     ("", ""),
@@ -347,6 +351,8 @@ enum Action {
     /// Properties of the open folder itself.
     FolderProperties,
     NewFolder,
+    /// An empty text file (Ctrl+Alt+N).
+    NewFile,
     /// Create a file from the template at this index.
     NewItem(usize),
     LoadTemplates,
@@ -1333,6 +1339,18 @@ impl App {
         });
     }
 
+    /// A new empty text file, then rename it.
+    fn new_file(&mut self) {
+        if !is_real(&self.cwd) {
+            return;
+        }
+        let dir = self.cwd.clone();
+        self.spawn_io(move || Some(match templates::create(&dir, &templates::Item::text_file()) {
+            Ok(name) => Msg::Created { dir, name },
+            Err(error) => Msg::Error(error),
+        }));
+    }
+
     fn load_templates(&mut self) {
         if self.templates_loading || self.templates.is_some() {
             return;
@@ -2052,6 +2070,9 @@ impl App {
         if pressed(Modifiers::CTRL | Modifiers::SHIFT, Key::N) {
             self.new_folder();
         }
+        if pressed(Modifiers::CTRL | Modifiers::ALT, Key::N) {
+            self.new_file();
+        }
         if pressed(Modifiers::NONE, Key::F2)
             && let Some(i) = self.focus.filter(|&i| self.row(i).is_some_and(|r| r.sel))
         {
@@ -2263,6 +2284,7 @@ impl App {
                 self.open_folder_properties();
             }
             Action::NewFolder => self.new_folder(),
+            Action::NewFile => self.new_file(),
             Action::NewItem(index) => self.create_from_template(index),
             Action::LoadTemplates => self.load_templates(),
             Action::Undo => self.undo(),

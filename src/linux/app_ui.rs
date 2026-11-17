@@ -57,6 +57,16 @@ impl App {
             if nav(ui, parent_of(&self.cwd).is_some(), "⬆", "Up (Alt+↑)") {
                 self.go_up();
             }
+            let mut new_action = None;
+            ui.add_enabled_ui(is_real(&self.cwd), |ui| {
+                ui.menu_button("➕", |ui| self.new_menu(ui, &mut new_action))
+                    .response
+                    .on_hover_text("New folder or file (Ctrl+Shift+N, Ctrl+Alt+N)");
+            });
+            if new_action.is_some() {
+                let ctx = ui.ctx().clone();
+                self.run_action(new_action, &ctx);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.menu_button("☰", |ui| self.main_menu(ui));
                 let hint = match (self.regex, self.recursive) {
@@ -680,7 +690,8 @@ impl App {
         if let Some(i) = self.scroll_to.take() {
             let top = i as f32 * ROW_H;
             let mut y = self.scroll_y;
-            if top < y {
+            // Before the first frame has measured the list, show the row at the top.
+            if top < y || self.view_h <= 0.0 {
                 y = top;
             } else if top + ROW_H > y + self.view_h {
                 y = top + ROW_H - self.view_h;
@@ -703,9 +714,21 @@ impl App {
         let mut visible = 0..0;
 
         ui.spacing_mut().item_spacing.y = 0.0;
-        let out = area.show_rows(ui, ROW_H, self.view.len(), |ui, range| {
+        let out = area.show_rows(ui, ROW_H, self.view.len() + BLANK_ROWS, |ui, range| {
             visible = range.clone();
             for vi in range {
+                if vi >= self.view.len() {
+                    // Trailing blank row: behaves like the empty space below.
+                    let (_, resp) = ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::click_and_drag());
+                    if resp.clicked() {
+                        action = Some(Action::ClearSelection);
+                    } else if resp.drag_started_by(PointerButton::Primary) {
+                        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(resp.rect.left_top());
+                        action = Some(Action::StartBand { origin, additive: mods.ctrl });
+                    }
+                    self.background_menu(&resp, &mut action);
+                    continue;
+                }
                 let Some(row) = self.row(vi) else { continue };
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::click_and_drag());
                 let selected = row.sel;
@@ -855,7 +878,7 @@ impl App {
         // Empty space below the last row (show_rows sizes its content to the
         // rows exactly, so it's handled here): click clears, drag draws a
         // selection box, right-click is the folder's menu.
-        let below = out.inner_rect.top() + self.view.len() as f32 * ROW_H - self.scroll_y;
+        let below = out.inner_rect.top() + (self.view.len() + BLANK_ROWS) as f32 * ROW_H - self.scroll_y;
         if below < out.inner_rect.bottom() - 1.0 {
             let rest = Rect::from_min_max(egui::pos2(out.inner_rect.left(), below.max(out.inner_rect.top())), out.inner_rect.max);
             let resp = ui.interact(rest, ui.scope_id().with("below_rows"), Sense::click_and_drag());
@@ -920,6 +943,10 @@ impl App {
     fn new_menu(&self, ui: &mut Ui, action: &mut Option<Action>) {
         if ui.add(Button::new("Folder").shortcut_text("Ctrl+Shift+N")).clicked() {
             *action = Some(Action::NewFolder);
+            ui.close();
+        }
+        if ui.add(Button::new("Text file").shortcut_text("Ctrl+Alt+N")).clicked() {
+            *action = Some(Action::NewFile);
             ui.close();
         }
         ui.separator();

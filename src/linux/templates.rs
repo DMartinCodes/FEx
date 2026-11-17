@@ -21,6 +21,13 @@ pub struct Item {
     pub name: Vec<u8>,
 }
 
+impl Item {
+    /// An empty `New text file.txt`, for Ctrl+Alt+N.
+    pub fn text_file() -> Self {
+        Item { label: "Text file".into(), extension: ".txt".into(), source: None, name: b"New text file.txt".to_vec() }
+    }
+}
+
 /// Templates, sorted by label, after the empty document.
 pub fn load() -> Vec<Item> {
     let mut out = Vec::new();
