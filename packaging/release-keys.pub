@@ -6,4 +6,5 @@
 # (so installed copies learn the new one), then sign with the new key and
 # remove the old line in a later release.
 #
-# No key yet: until one is added, builds refuse to install updates.
+# Release key 1 (added 2026-11-17).
+RWRzvtB9XmIg+5gPH6FmYFDefKlr3M2LyC9ACLos1cq1IS+yuKRukrV9
