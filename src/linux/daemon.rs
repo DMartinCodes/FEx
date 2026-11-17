@@ -116,7 +116,7 @@ impl Shared {
 /// Filesystems that only report local changes, or none at all: not crawled
 /// unless asked for, since crawling them loads a shared server.
 fn is_network_fs(t: &str) -> bool {
-    matches!(t, "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "fuse.sshfs" | "ceph" | "lustre" | "glusterfs" | "fuse.glusterfs" | "beegfs" | "gpfs" | "9p" | "afs")
+    sys::is_network_fs(t)
 }
 
 /// Folders the index leaves out: pseudo filesystems, network mounts (unless

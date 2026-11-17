@@ -23,6 +23,9 @@ eframe = { version = "0.37.0", default-features = false, features = ["x11"] }
 # render on minimal installs too.
 egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
 libc = "0.2"
+# File clipboard and dragging files out to other apps (X11 selections and
+# XDND), which eframe doesn't expose. Already in the tree through winit.
+x11rb = { version = "0.13", features = ["xfixes"] }
 
 [profile.release]
 opt-level = 3

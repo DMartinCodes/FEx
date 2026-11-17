@@ -1,23 +1,35 @@
-//! Linux port prototype.
+//! The Linux port.
 //!
-//! Its own engine (getdents64/statx, a names-only index, inotify) and a
-//! reduced UI on X11, sharing the platform-neutral modules (`pool`,
+//! Its own engine (getdents64/statx, a names-only index, inotify) and the
+//! full UI on X11, sharing the platform-neutral modules (`pool`,
 //! `typeahead`) with the Windows build. Nothing here is compiled on Windows.
 //!
 //! `fex --bench <folder> [query ...]` measures the engine without a window.
 
 mod app;
+mod archive;
+mod clip;
 mod daemon;
 mod fanotify;
+mod fileop;
 mod fsys;
+mod history;
 mod index;
+mod net;
+mod ops;
 mod profile;
+mod props;
+mod recent;
+mod session;
 pub(crate) mod proto;
 mod snapshot;
 mod sys;
+mod templates;
 mod throttle;
+mod trash;
 mod walk;
 mod watch;
+mod xdnd;
 
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
@@ -25,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-const USAGE: &str = "usage: fex [folder]
+const USAGE: &str = "usage: fex [folder] [--at x,y] [--size w,h]
        fex daemon [--root /] [--state-dir /var/lib/fex] [--socket PATH] [--workers N]
                   [--sweep-every SECS] [--save-every SECS] [--io-limit PCT] [--reserve PCT] [--memory-floor PCT]
                   [--no-fanotify] [--include-network]
@@ -87,7 +99,7 @@ pub fn main() -> ExitCode {
         Some("status") => cli_status(),
         Some("profile") => cli_profile(&args[1..]),
         Some("update") => ExitCode::from(crate::update::cli(&args[1..]).clamp(0, 255) as u8),
-        _ => gui(args.into_iter().next()),
+        _ => gui(args),
     }
 }
 
@@ -128,19 +140,62 @@ fn preflight() -> Result<(), String> {
     ))
 }
 
-fn gui(start: Option<String>) -> ExitCode {
+/// Command line of the window: `fex [location] [--at x,y] [--size w,h]`.
+/// The options place a window opened by tearing off a tab where it was dropped.
+struct WindowArgs {
+    start: Option<String>,
+    at: Option<[f32; 2]>,
+    size: Option<[f32; 2]>,
+}
+
+fn window_args(args: Vec<String>) -> WindowArgs {
+    let pair = |v: Option<String>| {
+        let v = v?;
+        let (a, b) = v.split_once(',')?;
+        Some([a.trim().parse().ok()?, b.trim().parse().ok()?])
+    };
+    let mut out = WindowArgs { start: None, at: None, size: None };
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--at" => out.at = pair(it.next()),
+            "--size" => out.size = pair(it.next()),
+            _ => out.start = Some(arg),
+        }
+    }
+    out
+}
+
+fn gui(args: Vec<String>) -> ExitCode {
     if let Err(e) = preflight() {
         eprintln!("FEx could not start. {e}");
         return ExitCode::FAILURE;
     }
-    let viewport = egui::ViewportBuilder::default()
+    let args = window_args(args);
+    let session = session::Session::load().unwrap_or_default();
+    // Without a location, carry on where the last window left off.
+    let restore = args.start.is_none();
+    let size = args.size.or(session.size).unwrap_or([1100.0, 700.0]);
+    let mut viewport = egui::ViewportBuilder::default()
         .with_title("FEx")
         .with_app_id("fex")
-        .with_inner_size([1100.0, 700.0])
+        .with_inner_size(size)
         .with_min_inner_size([520.0, 320.0])
         .with_icon(window_icon());
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
-    match eframe::run_native("FEx", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, start))))) {
+    if let Some(pos) = args.at.or(session.pos.filter(|_| restore)) {
+        viewport = viewport.with_position(pos);
+    }
+    if restore && session.maximized {
+        viewport = viewport.with_maximized(true);
+    }
+    let options = eframe::NativeOptions {
+        viewport,
+        // Ctrl+C/X/V operate on files; app.rs re-translates them for text fields.
+        clipboard_shortcuts: false,
+        ..Default::default()
+    };
+    let start = args.start;
+    match eframe::run_native("FEx", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, start, &session, restore))))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("FEx could not start: {e}\nFEx draws with OpenGL through X11; check that DISPLAY is set and a GL driver (Mesa) is installed.");

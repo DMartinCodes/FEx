@@ -1852,6 +1852,10 @@ impl FexApp {
         if pressed(Modifiers::NONE, Key::F1) {
             self.help_open = !self.help_open;
         }
+        // Escape closes the shortcuts sheet before it does anything else.
+        if self.help_open && pressed(Modifiers::NONE, Key::Escape) {
+            self.help_open = false;
+        }
         if pressed(Modifiers::CTRL, Key::H) {
             self.toggle_hidden();
         }
@@ -3434,7 +3438,8 @@ impl FexApp {
                     egui::Grid::new("shortcuts").num_columns(2).spacing([24.0, 4.0]).striped(false).show(ui, |ui| {
                         for (keys, what) in SHORTCUTS {
                             if keys.is_empty() {
-                                ui.add_space(6.0);
+                                // A blank row (add_space isn't allowed in a grid).
+                                ui.label("");
                                 ui.end_row();
                                 continue;
                             }

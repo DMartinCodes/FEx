@@ -50,7 +50,7 @@ mod win;
 mod winsvc;
 mod wire;
 
-// Linux port prototype: its own engine and UI. Shares only the portable
+// The Linux port: its own engine and UI. Shares only the portable
 // modules above that are not gated to Windows.
 #[cfg(target_os = "linux")]
 mod linux;

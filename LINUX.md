@@ -1,4 +1,4 @@
-# FEx on Linux (prototype)
+# FEx on Linux
 
 The Linux port lives in `src/linux/` and is compiled only on Linux. The
 Windows build is unchanged: its modules are gated with `#[cfg(windows)]` in
@@ -31,19 +31,44 @@ Under a Wayland session FEx runs through XWayland.
 
 ## What works
 
-- Browsing with sizes and dates, sort by name / date / type / size, folders first
-- Virtualized table (only visible rows are drawn), all I/O off the UI thread
-- Live updates of the open folder (inotify, coalesced per name)
-- Indexed search: keywords, `*`/`?` globs, `type:ext`, regex mode; exact
-  match count, results capped at 250,000 rows. Uses the index daemon when
-  one is running and covers the folder, else builds an index in-process.
-- Type-to-find (same ranking as on Windows), keyboard navigation and
-  selection, path bar with breadcrumbs (Ctrl+L), hidden files (Ctrl+H)
-- Sidebar: XDG user folders and mounted volumes (from `/proc/self/mountinfo`)
-- Open with the default application (`xdg-open`), copy path
+The Linux UI has the Windows UI's features and layout (`src/linux/app.rs`,
+`app_ui.rs` and `netview.rs` follow `src/app.rs` and `src/netview.rs`); the
+platform parts are Linux-native:
 
-Not yet: file operations (copy/move/delete/rename, trash, undo), clipboard
-file transfer, drag and drop, tabs, properties, network browsing.
+| Windows | Linux |
+|---|---|
+| Copy/move engine (`ops.rs`) | Same design (`linux/ops.rs`): reflink (`FICLONE`), then `copy_file_range` (server-side on NFS 4.2/SMB3), then read/write; `renameat2(RENAME_NOREPLACE)`; mode and times kept; links copied as links, never followed |
+| Recycle Bin | freedesktop Trash (`linux/trash.rs`): `~/.local/share/Trash`, or the volume's `.Trash-$uid`; shared with every file manager. Undo restores from it |
+| Explorer clipboard (CF_HDROP) | X11 CLIPBOARD (`linux/clip.rs`) in `x-special/gnome-copied-files`, `text/uri-list` (+ KDE's cut flag) and plain text: copy/cut/paste works with Nautilus, Nemo, Caja, Thunar, Dolphin |
+| OLE drag out / drop in | XDND (`linux/xdnd.rs`) to drag files out to any program; winit's drop target for files dragged in, landing on the folder under the pointer |
+| ShellNew templates | `~/Templates` (XDG) plus an empty document |
+| Mapped drives, Network page | GVFS through `gio` (`linux/net.rs`): connect `smb://`, `sftp://`, `ftp://`, `dav://` shares (and `\\server\share`), FEx's own credentials dialog, browse a server's shares, disconnect |
+| Safely eject | udisks (`udisksctl unmount`, then power-off, or detach for disk images), polkit asks if needed; `gio mount -e` as fallback |
+| Run as administrator | Run as root through `pkexec` (executables only) |
+| Recent, session, tabs, windows | Same; files under `~/.config/fex` and `~/.local/share/fex` |
+
+Everything else is the Windows behaviour: tabs (drag to reorder or tear
+off into a window, spring-loaded drop targets), undo/redo of every file
+operation, conflict choices (replace, update, skip, keep both), inline
+rename, rubber-band selection, cut marks, ZIP browsing and safe extraction,
+search below the folder or filter the folder, F1 shortcuts, session restore,
+Properties (with POSIX permissions and ACLs), drives with capacity bars
+(network ones on request) that follow mounts as they come and go.
+
+Desktop integration: on first start FEx installs a desktop entry and its
+icon under `~/.local/share` (unless one is installed), so menus, the panel
+and Alt+Tab show its name and logo; its window class is `fex`. Icon glyphs
+come from the system's symbol fonts through fontconfig (DejaVu Sans, Noto
+Sans Symbols 2), as Windows uses Segoe UI Symbol.
+
+Runtime tools used when present: `xdg-open` (opening files), `gio`
+(network shares; `libglib2.0-bin` and `gvfs-backends`), `udisksctl`
+(ejecting), `pkexec` (run as root), `fc-match` (fonts).
+
+Not on Linux: dragging a tab into *another* FEx window (tearing off works);
+virtual files dropped from other programs (only real files arrive through
+XDND); clipboard contents beyond one X request (about 256 KB of paths) need
+INCR, which FEx doesn't serve yet.
 
 ## Index daemon (`fex daemon`)
 
@@ -243,9 +268,5 @@ Earlier engine numbers: recording metadata during the crawl costs
 
 ## Next steps
 
-1. File operations: `renameat2` (`RENAME_NOREPLACE`), `copy_file_range`
-   (reflinks on Btrfs/XFS, server-side copy on NFS 4.2/SMB3) in the existing
-   parallel, largest-first transfer design; freedesktop Trash.
-2. Clipboard and drag and drop: `text/uri-list` and
-   `x-special/gnome-copied-files`; XDND for dragging files out.
-3. Windows: see WINDOWS.md for the index service.
+1. The gaps listed under "Not on Linux" above.
+2. Windows: see WINDOWS.md for the index service.
