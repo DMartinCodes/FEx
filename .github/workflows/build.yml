@@ -1,0 +1,60 @@
+# Builds FEx for Windows (MSVC, with the embedded manifest and icon) and
+# Linux, publishes the binaries as artifacts, then runs the tests on each.
+# The binaries are uploaded before the tests run, so they can be downloaded
+# even if a test fails.
+name: build
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version
+      - name: Build (release)
+        run: cargo build --release --locked
+      - name: Upload fex.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex-windows-x64
+          path: |
+            target/release/fex.exe
+            WINDOWS.md
+          if-no-files-found: error
+      - name: Test
+        run: cargo test --locked
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version
+      - name: Build (release)
+        run: cargo build --release --locked
+      - name: Upload fex
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex-linux-x64
+          path: |
+            target/release/fex
+            LINUX.md
+            packaging/linux/fex-indexd.service
+          if-no-files-found: error
+      - name: Test
+        run: cargo test --locked

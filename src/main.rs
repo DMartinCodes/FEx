@@ -1,31 +1,64 @@
 //! FEx — File Explorer expert.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(windows)]
 mod app;
+#[cfg(windows)]
 mod archive;
+#[cfg(windows)]
 mod clip;
+#[cfg(windows)]
 mod fileop;
+#[cfg(windows)]
 mod fsys;
+#[cfg(windows)]
 mod history;
+#[cfg(windows)]
 mod index;
+#[cfg(windows)]
 mod net;
+#[cfg(windows)]
 mod oledrag;
+#[cfg(windows)]
 mod oledrop;
+#[cfg(windows)]
 mod ops;
+mod memory;
 mod pool;
+#[cfg(windows)]
 mod props;
+#[cfg(windows)]
 mod recent;
+#[cfg(windows)]
 mod recyclebin;
+mod reserve;
+#[cfg(windows)]
 mod security;
+#[cfg(windows)]
 mod session;
+#[cfg(windows)]
 mod shellnew;
 mod typeahead;
+mod update;
+#[cfg(windows)]
 mod walk;
+#[cfg(windows)]
 mod watch;
+#[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod winsvc;
+mod wire;
 
+// Linux port prototype: its own engine and UI. Shares only the portable
+// modules above that are not gated to Windows.
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(windows)]
 use eframe::egui;
 
+#[cfg(windows)]
 /// Release builds have no console, so a panic would otherwise vanish without
 /// a trace. Log it to `%LOCALAPPDATA%\FEx\crash.log` and tell the user.
 fn install_crash_reporter() {
@@ -54,10 +87,12 @@ fn install_crash_reporter() {
     }));
 }
 
+#[cfg(windows)]
 /// Where a native crash's minidump goes, as NUL-terminated UTF-16. Prepared
 /// up front: after an access violation, allocating may no longer work.
 static DUMP_PATH: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
 
+#[cfg(windows)]
 /// Native crashes (an access violation in unsafe code, a fault inside a
 /// Windows API) never reach the panic hook. Write a minidump to
 /// `%LOCALAPPDATA%\FEx\crash.dmp`, then let Windows end the process as usual.
@@ -69,6 +104,7 @@ fn install_dump_writer() {
     unsafe { SetUnhandledExceptionFilter(Some(write_dump)) };
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn write_dump(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL};
@@ -97,12 +133,14 @@ unsafe extern "system" fn write_dump(info: *const windows_sys::Win32::System::Di
     EXCEPTION_CONTINUE_SEARCH
 }
 
+#[cfg(windows)]
 /// The title bar and taskbar icon (generated from `assets/fex_icon.png` by build.rs).
 fn window_icon() -> egui::IconData {
     const SIDE: u32 = 64;
     egui::IconData { rgba: include_bytes!(concat!(env!("OUT_DIR"), "/icon_64.rgba")).to_vec(), width: SIDE, height: SIDE }
 }
 
+#[cfg(windows)]
 /// Command line: `fex [location] [--at x,y] [--size w,h]`. The options place
 /// a window opened by tearing off a tab where the tab was dropped.
 struct Args {
@@ -111,6 +149,7 @@ struct Args {
     size: Option<[f32; 2]>,
 }
 
+#[cfg(windows)]
 fn parse_args() -> Args {
     let pair = |v: Option<String>| {
         let v = v?;
@@ -129,7 +168,21 @@ fn parse_args() -> Args {
     args
 }
 
+#[cfg(windows)]
 fn main() -> eframe::Result {
+    // `fex service ...`: the index service and its tools, no window.
+    if std::env::args().nth(1).as_deref() == Some("service") {
+        // Native crashes leave a minidump; panics are logged by winsvc.
+        install_dump_writer();
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(winsvc::cli(&args));
+    }
+    // `fex update ...`: signed updates from GitHub releases.
+    if std::env::args().nth(1).as_deref() == Some("update") {
+        winsvc::attach_console();
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(update::cli(&args));
+    }
     install_crash_reporter();
     install_dump_writer();
     let args = parse_args();
@@ -171,3 +224,8 @@ fn main() -> eframe::Result {
     result
 }
 
+
+#[cfg(target_os = "linux")]
+fn main() -> std::process::ExitCode {
+    linux::main()
+}

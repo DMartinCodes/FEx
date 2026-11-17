@@ -1,0 +1,3 @@
+# Test data must stay byte-exact on every platform: signatures cover exact
+# bytes, and format fixtures are binary (no CRLF conversion on Windows).
+testdata/** -text

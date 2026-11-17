@@ -284,6 +284,35 @@ pub struct Index {
     pub dirty: bool,
 }
 
+/// Which folders' entries a query may report. The index service implements
+/// this per client, so users only see names in folders they could list.
+pub trait Visibility: Sync {
+    /// Runs on each worker thread before it checks anything (to take on the
+    /// client's identity); dropping the result undoes it.
+    fn enter(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+    /// Whether entries of folder `dir` (a global id below `dir_slots`, at
+    /// `path`) may be reported.
+    fn visible(&self, dir: usize, path: &str) -> bool;
+    /// False when everything is visible, so queries skip the checks.
+    fn filters(&self) -> bool {
+        true
+    }
+}
+
+/// No filtering (the app's own indexes).
+pub struct Everything;
+
+impl Visibility for Everything {
+    fn visible(&self, _: usize, _: &str) -> bool {
+        true
+    }
+    fn filters(&self) -> bool {
+        false
+    }
+}
+
 /// Entries per query work unit: big enough to amortize dispatch, small
 /// enough to balance across cores.
 const CHUNK: usize = 32 * 1024;
@@ -373,7 +402,37 @@ impl Index {
         limit: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Option<(Vec<Row>, usize)> {
+        self.query_as(m, scope, limit, cancelled, &Everything)
+    }
+
+    /// Paths of every folder with a live listing.
+    pub fn folder_paths(&self) -> Vec<Arc<str>> {
+        self.dirs.values().map(|&(s, d)| self.shards[s as usize].dirs[d as usize].clone()).collect()
+    }
+
+    /// Number of global folder ids (live and dead), for per-query caches.
+    pub fn dir_slots(&self) -> usize {
+        self.shards.iter().map(|s| s.dirs.len()).sum()
+    }
+
+    /// `query` reporting (and counting) only entries of folders `vis`
+    /// allows (the index service filters per client this way).
+    pub fn query_as(
+        &self,
+        m: &Matcher,
+        scope: &str,
+        limit: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        vis: &dyn Visibility,
+    ) -> Option<(Vec<Row>, usize)> {
         let units = self.query_units(scope);
+        let mut base = Vec::with_capacity(self.shards.len());
+        let mut acc = 0;
+        for s in &self.shards {
+            base.push(acc);
+            acc += s.dirs.len();
+        }
+        let filters = vis.filters();
         let total = AtomicUsize::new(0);
         let retained = AtomicUsize::new(0);
         let aborted = AtomicBool::new(false);
@@ -384,11 +443,27 @@ impl Index {
                 aborted.store(true, Relaxed);
                 return;
             }
+            let _guard = if filters { vis.enter() } else { None };
             let (si, a, b) = units[u];
             let shard = &self.shards[si];
             let mut out = Vec::new();
             let mut count = 0;
+            let mut last: Option<(u32, bool)> = None;
             shard.scan(m, a, b, |i| {
+                if filters {
+                    let d = shard.meta[i].dir;
+                    let ok = match last {
+                        Some((ld, ok)) if ld == d => ok,
+                        _ => {
+                            let ok = vis.visible(base[si] + d as usize, &shard.dirs[d as usize]);
+                            last = Some((d, ok));
+                            ok
+                        }
+                    };
+                    if !ok {
+                        return;
+                    }
+                }
                 count += 1;
                 if retained.load(Relaxed) < limit {
                     let slot = retained.fetch_add(1, Relaxed);
@@ -558,33 +633,74 @@ impl Index {
         }
         let _one = SAVING.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = store_dir().ok_or_else(|| io::Error::other("LOCALAPPDATA is not set"))?;
-        fs::create_dir_all(&dir)?;
-        let path = file_for(&dir, &self.root);
+        let path = self.save_to(&dir)?;
+        prune(&dir, &path, &self.root);
+        Ok(())
+    }
+
+    /// Where an index of `root` is saved in `dir`.
+    pub fn saved_path(dir: &Path, root: &str) -> PathBuf {
+        file_for(dir, root)
+    }
+
+    /// Write the live listings to `dir` (temp file, then rename), without
+    /// the per-user checks of `save`: for the index service, whose folder
+    /// only SYSTEM and administrators can read. Returns the file written.
+    pub fn save_to(&self, dir: &Path) -> io::Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        let path = file_for(dir, &self.root);
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         {
             let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
-            w.write_all(MAGIC)?;
-            put_str(&mut w, &self.root)?;
-            w.write_all(&(self.build_time.as_millis() as u64).to_le_bytes())?;
-            w.write_all(&(self.errors as u64).to_le_bytes())?;
-            w.write_all(&(self.dirs.len() as u64).to_le_bytes())?;
-            for &(s, d) in self.dirs.values() {
-                let shard = &self.shards[s as usize];
-                let (a, b) = shard.ranges[d as usize];
-                put_str(&mut w, &shard.dirs[d as usize])?;
-                w.write_all(&((b - a) as u32).to_le_bytes())?;
-                for i in a..b {
-                    let m = shard.meta[i];
-                    put_str(&mut w, shard.name(i))?;
-                    w.write_all(&m.attrs.to_le_bytes())?;
-                    w.write_all(&m.size.to_le_bytes())?;
-                    w.write_all(&m.mtime.to_le_bytes())?;
-                }
-            }
+            self.write_listings(&mut w)?;
             w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         }
         fs::rename(&tmp, &path)?;
-        prune(&dir, &path, &self.root);
+        Ok(path)
+    }
+
+    /// The saved form in memory, for writing with `write_saved` after the
+    /// index lock is released (the index service: disk I/O and fsync then
+    /// don't hold up updates or the queries queued behind them).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.entries * 40 + self.dirs.len() * 64);
+        self.write_listings(&mut out).expect("writing to memory");
+        out
+    }
+
+    /// Write `bytes` from `serialize` as the saved index of `root` in `dir`.
+    pub fn write_saved(dir: &Path, root: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        let path = file_for(dir, root);
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        Ok(path)
+    }
+
+    fn write_listings(&self, w: &mut impl Write) -> io::Result<()> {
+        w.write_all(MAGIC)?;
+        put_str(w, &self.root)?;
+        w.write_all(&(self.build_time.as_millis() as u64).to_le_bytes())?;
+        w.write_all(&(self.errors as u64).to_le_bytes())?;
+        w.write_all(&(self.dirs.len() as u64).to_le_bytes())?;
+        for &(s, d) in self.dirs.values() {
+            let shard = &self.shards[s as usize];
+            let (a, b) = shard.ranges[d as usize];
+            put_str(w, &shard.dirs[d as usize])?;
+            w.write_all(&((b - a) as u32).to_le_bytes())?;
+            for i in a..b {
+                let m = shard.meta[i];
+                put_str(w, shard.name(i))?;
+                w.write_all(&m.attrs.to_le_bytes())?;
+                w.write_all(&m.size.to_le_bytes())?;
+                w.write_all(&m.mtime.to_le_bytes())?;
+            }
+        }
         Ok(())
     }
 
@@ -760,10 +876,19 @@ fn lock_pending(m: &Mutex<Pending>) -> MutexGuard<'_, Pending> {
 }
 
 impl Freshener {
-    pub fn start(root: Arc<str>) -> Freshener {
+    /// Start watching `root`, disregarding changes at or below the folders
+    /// in `ignore` (the index service's own state and log, which would
+    /// otherwise mark the index changed with every save; empty for the app).
+    pub fn start_ignoring(root: Arc<str>, ignore: Arc<[String]>) -> Freshener {
         let state = Arc::new(Mutex::new(Pending { target: None, backlog: Vec::new(), overflowed: false }));
         let (s, r) = (state.clone(), root.clone());
-        let watcher = watch::watch_tree(root.to_string(), move |batch| {
+        let watcher = watch::watch_tree(root.to_string(), move |mut batch| {
+            if let Some(changes) = batch.as_mut().filter(|_| !ignore.is_empty()) {
+                changes.retain(|(_, rel)| !ignore.iter().any(|i| in_scope(&fsys::join(&r, rel), i)));
+                if changes.is_empty() {
+                    return;
+                }
+            }
             let mut st = lock_pending(&s);
             match batch {
                 Some(changes) if st.backlog.len() + changes.len() <= MAX_BACKLOG => st.backlog.extend(changes),
@@ -799,6 +924,31 @@ fn flush(root: &str, st: &mut Pending) {
     if !changes.is_empty() && refresh(root, index, changes) {
         on_change(Freshness::Changed);
     }
+}
+
+/// Re-read `dirs` (or their nearest indexed ancestors) and crawl what's new
+/// below them: for changes learned elsewhere (the NTFS change journal).
+/// Returns how many folders were re-read.
+pub fn refresh_dirs(index: &Shared, dirs: Vec<String>) -> usize {
+    let mut seen: HashSet<Box<str>> = HashSet::new();
+    let mut pending: Vec<Arc<str>> = Vec::new();
+    {
+        let idx = read(index);
+        for d in dirs {
+            if let Some(dir) = idx.known_ancestor(&d)
+                && seen.insert(key(&dir))
+            {
+                pending.push(dir.into());
+            }
+        }
+    }
+    let mut n = 0;
+    while !pending.is_empty() {
+        n += pending.len();
+        let scans: Vec<DirScan> = pending.drain(..).map(read_dir).collect();
+        pending = write(index).apply(scans);
+    }
+    n
 }
 
 /// Apply watcher changes: metadata updates in place, everything else by
@@ -869,6 +1019,12 @@ impl Live {
     pub fn covers(&self, path: &str) -> bool {
         in_scope(path, &self.root)
     }
+
+    /// Whether the watcher has nothing queued and nothing being applied
+    /// (it applies each batch holding its lock); true without a watcher.
+    pub fn settled(&self) -> bool {
+        self._fresh.as_ref().is_none_or(|f| f.state.try_lock().is_ok_and(|p| p.backlog.is_empty()))
+    }
 }
 
 // ----------------------------------------------------------------- build
@@ -883,6 +1039,17 @@ pub struct Build {
     pub dirs_done: AtomicUsize,
     pub entries: AtomicUsize,
     pub started: Instant,
+    hooks: Option<Hooks>,
+}
+
+/// Crawl hooks for background builds (the index service): `init` runs once
+/// on each crawler thread (to lower its priority), `pace` before each folder
+/// (to account CPU time and pause while the machine is busy).
+pub struct Hooks {
+    pub init: Box<dyn Fn() + Send + Sync>,
+    pub pace: Box<dyn Fn() + Send + Sync>,
+    /// Folders whose changes the finished index's watcher disregards.
+    pub ignore: Arc<[String]>,
 }
 
 impl Build {
@@ -895,7 +1062,15 @@ impl Build {
             dirs_done: AtomicUsize::new(0),
             entries: AtomicUsize::new(0),
             started: Instant::now(),
+            hooks: None,
         })
+    }
+
+    /// A build whose crawler threads run `hooks` (see `Hooks`).
+    pub fn with_hooks(root: &str, hooks: Hooks) -> Arc<Build> {
+        let mut b = Arc::try_unwrap(Build::new(root)).unwrap_or_else(|_| unreachable!());
+        b.hooks = Some(hooks);
+        Arc::new(b)
     }
 
     pub fn set_matcher(&self, generation: u64, m: Option<Arc<Matcher>>) {
@@ -914,7 +1089,8 @@ impl Build {
     /// Crawl `root` on all cores. Calls `on_hits(generation, rows)` with
     /// batches of streamed matches. Returns `None` if cancelled.
     pub fn run(&self, on_hits: &(dyn Fn(u64, Vec<Row>) + Sync)) -> Option<Index> {
-        *self.fresh.lock().unwrap_or_else(PoisonError::into_inner) = Some(Freshener::start(self.root.clone()));
+        let ignore = self.hooks.as_ref().map_or_else(|| Arc::from([]), |h| h.ignore.clone());
+        *self.fresh.lock().unwrap_or_else(PoisonError::into_inner) = Some(Freshener::start_ignoring(self.root.clone(), ignore));
         let cores = walk::cores();
         // Network enumeration is latency-bound, so oversubscribe there.
         let workers = std::env::var("FEX_CRAWL_THREADS")
@@ -944,6 +1120,9 @@ impl Build {
 
     fn worker(&self, queue: &Queue, on_hits: &(dyn Fn(u64, Vec<Row>) + Sync)) -> (Shard, usize) {
         let _enlisted = queue.enlist();
+        if let Some(h) = &self.hooks {
+            (h.init)();
+        }
         let mut shard = Shard::default();
         let mut local: Vec<Arc<str>> = Vec::new();
         let mut name = String::new();
@@ -967,6 +1146,9 @@ impl Build {
             };
             if self.cancel.load(Relaxed) {
                 break;
+            }
+            if let Some(h) = &self.hooks {
+                (h.pace)();
             }
             let (generation, matcher) = self.matcher.read().unwrap_or_else(PoisonError::into_inner).clone();
             if generation != hits_gen {
@@ -1152,6 +1334,67 @@ mod tests {
         let mut found: Vec<String> = index.query(&m, &index.root, MAX, &|| false).unwrap().0.into_iter().map(|r| r.name.to_string()).collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn serialized_save_loads_back() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("fex-serialize-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("one.txt"), b"1").unwrap();
+        fs::write(root.join("sub").join("two.txt"), b"22").unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let idx = Build::new(&r).run(&|_, _| {}).unwrap();
+        let store = root.with_extension("store");
+        let path = Index::write_saved(&store, &idx.root, &idx.serialize()).unwrap();
+        assert_eq!(path, Index::saved_path(&store, &r));
+        let back = Index::load(&path).unwrap();
+        assert_eq!(names(&back, "txt"), ["one.txt", "two.txt"]);
+        assert_eq!(back.entries, idx.entries);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(store);
+    }
+
+    /// Indexes saved by released versions must keep loading: an update that
+    /// couldn't read them would re-crawl every drive. To change the format,
+    /// keep reading the old one, change `MAGIC`, and add a fixture.
+    #[test]
+    fn loads_released_index_formats() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join("formats");
+        let current = dir.join(format!("windows-index-{}.idx", std::str::from_utf8(MAGIC).unwrap()));
+        assert!(current.exists(), "no fixture for the current index format: add {}", current.display());
+        let idx = Index::load(&dir.join("windows-index-FEXIDX02.idx")).expect("format FEXIDX02 no longer loads");
+        assert_eq!(&*idx.root, "C:\\Fixture");
+        assert_eq!(idx.entries, 3);
+        assert_eq!(names(&idx, "txt"), ["a.txt", "b.txt"]);
+    }
+
+    /// What saving relies on: once the watcher reports settled, every change
+    /// it received is in the index.
+    #[test]
+    fn settled_means_changes_are_applied() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("fex-settled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let build = Build::new(&r);
+        let idx = build.run(&|_, _| {}).unwrap();
+        let live = Live::new(idx, build.take_freshener(), |_| {});
+        for i in 0..50 {
+            fs::write(root.join(format!("late{i}.txt")), b"x").unwrap();
+        }
+        // Give the watcher its read cycle, then wait for it to settle.
+        std::thread::sleep(Duration::from_millis(1500));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !live.settled() {
+            assert!(Instant::now() < deadline, "watcher never settled");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(names(&read(&live.index), "late").len(), 50);
+        drop(live);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

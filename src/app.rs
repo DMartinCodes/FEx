@@ -21,6 +21,7 @@ use crate::ops::{self, Conflict, Job, Kind, Phase};
 use crate::props::{self, Props};
 use crate::watch::{self, Change, Watcher};
 use crate::session::Session;
+use crate::winsvc::proto as service;
 use crate::{archive, clip, fileop, net, oledrag, oledrop, recyclebin, typeahead, win};
 use windows_sys::Win32::Foundation::HWND;
 
@@ -29,6 +30,8 @@ mod netview;
 
 /// Search results materialized for display; the total count is still exact.
 const MAX_RESULTS: usize = 250_000;
+/// Rows in the first chunk of an index service reply: more than a window shows.
+const SCREENFUL: u32 = 200;
 /// Queries are cancelled as soon as a newer one starts, so this only spares
 /// the work of a keystroke typed in quick succession.
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(30);
@@ -97,6 +100,15 @@ enum Msg {
     /// An index rooted here lost track of changes and needs a new crawl.
     IndexStale(Arc<str>),
     QueryDone { generation: u64, rows: Vec<Row>, total: usize, elapsed: Duration, sorted: (SortKey, bool) },
+    /// Latest status of the index service (`None`: not running).
+    Service(Option<service::Status>),
+    /// More rows of a search answered by the index service; `done` on the last.
+    ServiceMore { generation: u64, rows: Vec<Row>, done: bool },
+    /// The index service couldn't answer. `definitive`: it said it can't
+    /// (drive not covered, first index still building), so search with the
+    /// app's own index; else it didn't answer twice running, so report it
+    /// rather than start a crawl (the status poll notices a stopped service).
+    ServiceFailed { generation: u64, definitive: bool },
     /// Segoe UI Emoji, loaded after startup (it's 13 MB).
     EmojiFont(Vec<u8>),
     DriveSpace { path: String, is_network: bool, queried: bool, ejectable: bool, result: Option<(u64, u64)> },
@@ -209,6 +221,8 @@ pub struct FexApp {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     ctx: egui::Context,
+    /// Signed updates from GitHub releases (checked at start, then daily).
+    updater: crate::update::Updater,
 
     cwd: String,
     path_text: String,
@@ -313,6 +327,11 @@ pub struct FexApp {
     net: netview::NetState,
     /// FEx runs as administrator: nothing it does will ask for UAC approval.
     elevated: bool,
+    /// The index service, when it's running: it answers searches on the
+    /// drives it indexes, so the app doesn't crawl them itself.
+    service: Option<service::Status>,
+    /// It failed a search; use the app's own index until its next status.
+    service_failed: bool,
 }
 
 impl FexApp {
@@ -325,6 +344,10 @@ impl FexApp {
         let start = start.or_else(|| tabs.get(session.active).cloned());
         let mut app = Self::with_context(cc.egui_ctx.clone(), start);
         app.apply_session(session, tabs);
+        app.updater = {
+            let ctx = cc.egui_ctx.clone();
+            crate::update::Updater::start(move || ctx.request_repaint())
+        };
         let hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
             RawWindowHandle::Win32(w) => Some(w.hwnd.get() as HWND),
             _ => None,
@@ -355,6 +378,7 @@ impl FexApp {
             })
             .unwrap_or_else(|| RECENT.to_string());
         let mut app = FexApp {
+            updater: crate::update::Updater::default(),
             tx,
             rx,
             ctx,
@@ -436,7 +460,10 @@ impl FexApp {
             typeahead: None,
             net: netview::NetState::default(),
             elevated: win::is_elevated(),
+            service: None,
+            service_failed: false,
         };
+        app.watch_service();
         app.refresh_connections();
         app.navigate(start, false);
         app
@@ -1342,6 +1369,10 @@ impl FexApp {
             self.rebuild_view();
             return;
         }
+        if self.service_covers(&self.cwd) {
+            self.run_service_query(generation);
+            return;
+        }
         if let Some(live) = self.current_index() {
             self.run_query(live, m, generation);
             return;
@@ -1365,6 +1396,78 @@ impl FexApp {
             },
             move |_| Msg::IndexLoaded { scope: fallback, index: None },
         );
+    }
+
+    /// Poll the index service's status every few seconds (one small message
+    /// over a local pipe; fails at once when the service isn't installed).
+    fn watch_service(&self) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            loop {
+                if tx.send(Msg::Service(service::status().ok())).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+                thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
+
+    fn service_covers(&self, path: &str) -> bool {
+        !self.service_failed && self.service.as_ref().is_some_and(|s| s.covers(path))
+    }
+
+    /// Search through the index service: no crawl, and the first screenful
+    /// arrives sorted (by name) ahead of the rest. Rows carry their metadata.
+    fn run_service_query(&mut self, generation: u64) {
+        self.searching = true;
+        let (scope, text, regex) = (self.cwd.clone(), self.query.clone(), self.regex_mode);
+        let order = match (self.sort, self.descending) {
+            (SortKey::Name, false) => service::NAME_ASC,
+            (SortKey::Name, true) => service::NAME_DESC,
+            _ => service::UNORDERED,
+        };
+        // Rows that come unordered are reported as not in the shown order,
+        // so the result handler sorts them.
+        let sorted = if order == service::UNORDERED { (self.sort, !self.descending) } else { (self.sort, self.descending) };
+        let (tx, ctx, current) = (self.tx.clone(), self.ctx.clone(), self.generation.clone());
+        thread::spawn(move || {
+            let t = Instant::now();
+            let send = |m: Msg| {
+                let ok = current.load(Relaxed) == generation && tx.send(m).is_ok();
+                ctx.request_repaint();
+                ok
+            };
+            let ask = || service::query(&scope, &text, regex, MAX_RESULTS as u32, order, SCREENFUL, generation);
+            let mut reply = ask();
+            // A busy or momentarily refused connection gets one more try.
+            if reply.is_err() && current.load(Relaxed) == generation {
+                thread::sleep(Duration::from_millis(150));
+                reply = ask();
+            }
+            match reply {
+                Ok(service::Reply::Rows { rows, total, mut rest }) => {
+                    if !send(Msg::QueryDone { generation, rows, total, elapsed: t.elapsed(), sorted }) {
+                        return;
+                    }
+                    loop {
+                        let (rows, done) = match rest.next() {
+                            Ok(Some(rows)) => (rows, false),
+                            _ => (Vec::new(), true),
+                        };
+                        if !send(Msg::ServiceMore { generation, rows, done }) || done {
+                            return;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    send(Msg::ServiceFailed { generation, definitive: true });
+                }
+                Err(_) => {
+                    send(Msg::ServiceFailed { generation, definitive: false });
+                }
+            }
+        });
     }
 
     /// The best index for the open folder: an up-to-date one before a saved
@@ -1561,6 +1664,34 @@ impl FexApp {
                     let old = self.indexes.iter().find(|l| l.root == root).is_some_and(|l| l.created.elapsed() > STALE_GRACE);
                     if old && self.build.is_none() {
                         self.start_build(&root, None);
+                    }
+                }
+                Msg::Service(st) => {
+                    self.service_failed = false;
+                    self.service = st;
+                }
+                Msg::ServiceMore { generation, rows, done } if generation == current && self.in_results() => {
+                    for r in rows {
+                        if self.results.len() < MAX_RESULTS {
+                            if self.visible(&r) {
+                                self.view.push(self.results.len() as u32);
+                            }
+                            self.results.push(r);
+                        }
+                    }
+                    if done {
+                        let focus = self.focus_key();
+                        fsys::sort_rows_par(&mut self.results, self.sort, self.descending);
+                        self.rebuild_view_keeping(focus);
+                    }
+                }
+                Msg::ServiceFailed { generation, definitive } if generation == current => {
+                    if definitive {
+                        self.service_failed = true;
+                        self.start_search(generation);
+                    } else {
+                        self.searching = false;
+                        self.error = Some("The index service didn't answer; search again in a moment.".into());
                     }
                 }
                 Msg::QueryDone { generation, rows, total, elapsed, sorted } if generation == current => {
@@ -2464,7 +2595,11 @@ impl FexApp {
 
             // Search details stay out of the way: one short word, the rest on hover.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(b) = &self.build {
+                crate::update::status_widget(ui, &self.updater);
+                if let Some(s) = self.service.as_ref().filter(|s| !self.service_failed && s.covers(&self.cwd)) {
+                    let paused = if s.paused.is_empty() { String::new() } else { format!(" (paused: {})", s.paused) };
+                    ui.weak("Index service").on_hover_text(format!("{} entries · {}{paused}\n{}", s.entries, s.activity, s.reserve));
+                } else if let Some(b) = &self.build {
                     ui.weak(format!("Indexing… {} entries", b.entries.load(Relaxed))).on_hover_text(format!(
                         "Indexing {}: {} folders in {:.1}s",
                         b.root,
