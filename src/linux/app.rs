@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, Modifiers, PointerButton, Pos2, Rect};
 
+use super::appearance::Appearance;
 use super::fsys::{self, Row, SortKey};
 use super::history::{Entry, History, Step};
 use super::index::{Build, Index, Matcher};
@@ -516,12 +517,21 @@ pub struct App {
     font: Option<String>,
     /// When recent frames panicked (see `recover`).
     panics: Vec<Instant>,
+    /// Theme, font, size and which parts of the window are shown.
+    look: Appearance,
+    /// The Appearance window is open; `look_font` is its font field.
+    look_open: bool,
+    look_font: String,
+    /// The window was created see-through (frosted glass at start).
+    transparent: bool,
+    /// Blur behind the window as last requested from the compositor.
+    blur: Option<bool>,
 }
 
 impl App {
     /// `restore`: reopen the session's tabs (no location was given).
-    pub fn new(cc: &eframe::CreationContext<'_>, start: Option<String>, session: &Session, restore: bool) -> App {
-        ui::install_style(&cc.egui_ctx);
+    pub fn new(cc: &eframe::CreationContext<'_>, start: Option<String>, session: &Session, restore: bool, look: Appearance) -> App {
+        look.install(&cc.egui_ctx);
         let (tx, rx) = channel();
         let home = sys::home();
         let tabs = if restore { session.tabs.clone() } else { Vec::new() };
@@ -617,6 +627,11 @@ impl App {
             title: String::new(),
             font: None,
             panics: Vec::new(),
+            look_font: look.font.clone(),
+            transparent: look.wants_transparency(),
+            look,
+            look_open: false,
+            blur: None,
         };
         app.show_hidden = session.show_hidden;
         app.recursive = session.recursive;
@@ -628,7 +643,7 @@ impl App {
             app.tabs = tabs.into_iter().map(|location| Tab { location, back: Vec::new(), forward: Vec::new() }).collect();
             app.tabs[app.active_tab].location = cwd.clone();
         }
-        ui::load_fonts(&app.ctx, app.tx.clone(), String::new());
+        ui::load_fonts(&app.ctx, app.tx.clone(), app.look.font.clone());
         app.watch_daemon();
         app.watch_volumes();
         thread::spawn(archive::clean_cache);
@@ -2424,6 +2439,17 @@ impl eframe::App for App {
         self.session().save();
     }
 
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.transparent {
+            self.look.clear_color(visuals)
+        } else {
+            // An opaque window can't show through; paint the tint solid.
+            let mut c = visuals.panel_fill.to_normalized_gamma_f32();
+            c[3] = 1.0;
+            c
+        }
+    }
+
     /// Clipboard shortcuts are delivered as plain key events (see mod.rs) so
     /// Ctrl+C/X/V can act on files. While a text field has focus, turn them
     /// back into the text clipboard events egui's TextEdit expects.
@@ -2449,7 +2475,8 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.update_blur(frame);
         // A bug must not take the window (and whatever the user was doing)
         // down with it: the frame is abandoned, the details go to the crash
         // log (the panic hook), and the window carries on.
@@ -2460,6 +2487,44 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Ask the compositor for blur behind a see-through window when the
+    /// setting changes (an X round trip, so off the UI thread, and once).
+    fn update_blur(&mut self, frame: &eframe::Frame) {
+        let want = self.transparent && self.look.theme == super::appearance::Theme::Glass && self.look.glass_blur;
+        if self.blur == Some(want) {
+            return;
+        }
+        self.blur = Some(want);
+        if let Some(win) = super::appearance::x11_window(frame) {
+            thread::spawn(move || {
+                let _ = super::appearance::request_blur(win, want);
+            });
+        }
+    }
+
+    /// Put a changed look into effect and remember it.
+    fn set_look(&mut self, look: Appearance) {
+        if look == self.look {
+            return;
+        }
+        let font_changed = look.font != self.look.font;
+        let colours_changed = look.visuals() != self.look.visuals() || look.scale != self.look.scale;
+        self.look = look;
+        if colours_changed {
+            self.look.install(&self.ctx);
+        }
+        if font_changed {
+            ui::load_fonts(&self.ctx, self.tx.clone(), self.look.font.clone());
+        }
+        self.ctx.request_repaint();
+    }
+
+    fn save_look(&mut self) {
+        if let Err(e) = self.look.save() {
+            self.error = Some(e);
+        }
+    }
+
     /// After a panic in a frame: drop what was in progress, say so briefly,
     /// and, if it keeps happening, go back to a plain view of the home folder.
     fn recover(&mut self, panic: Box<dyn std::any::Any + Send>) {
