@@ -686,7 +686,7 @@ fn bench_interference(args: &[String]) -> ExitCode {
                     let pace: &(dyn Fn() + Sync) = if idle { &pace } else { &|| {} };
                     // Progress counts every entry seen, finished crawl or not.
                     while !stop.load(Relaxed) {
-                        let c = index::Crawl { workers: cores, cancel: stop, skip, with_meta: false, seen: entries, init, pace };
+                        let c = index::Crawl { workers: cores, cancel: stop, skip, with_meta: false, strict: false, seen: entries, init, pace };
                         let _ = index::build(root, &c);
                     }
                 });

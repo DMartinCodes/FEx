@@ -480,7 +480,7 @@ fn volume_of(path: &[u8]) -> Option<(String, String, String)> {
 fn count(dirs: &[Arc<[u8]>], u: &Usage) {
     let seen: Mutex<HashSet<(u32, u32, u64)>> = Mutex::default();
     let workers = walk::cores().min(8);
-    let (_, failed) = walk::walk(dirs, workers, &u.cancel, &HashSet::new(), &|| {}, || (), |_, _, visit| match visit {
+    let (_, failed) = walk::walk(dirs, workers, &u.cancel, &HashSet::new(), false, &|| {}, || (), |_, _, visit| match visit {
         Visit::Begin(_) => {}
         Visit::Entry(_, e) if e.flags & (DIR | LINK) == DIR => {
             u.dirs.fetch_add(1, Relaxed);

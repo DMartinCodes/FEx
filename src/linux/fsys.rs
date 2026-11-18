@@ -272,6 +272,11 @@ pub fn parent(path: &[u8]) -> Option<Vec<u8>> {
     Some(if i == 0 { b"/".to_vec() } else { p[..i].to_vec() })
 }
 
+/// `path` without trailing slashes (`/` itself becomes empty).
+pub fn trim_end_slashes(p: &[u8]) -> &[u8] {
+    trim_slashes(p)
+}
+
 fn trim_slashes(p: &[u8]) -> &[u8] {
     let mut end = p.len();
     while end > 0 && p[end - 1] == b'/' {
