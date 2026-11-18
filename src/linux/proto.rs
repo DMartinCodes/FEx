@@ -124,10 +124,17 @@ impl Stream {
     }
 }
 
+/// How long the first reply may take. A healthy daemon answers in
+/// milliseconds; one that doesn't is treated as absent (clients search by
+/// themselves) rather than leaving the user waiting.
+const FIRST_REPLY: Duration = Duration::from_secs(3);
+/// Between the chunks of a streamed reply.
+const NEXT_CHUNK: Duration = Duration::from_secs(30);
+
 fn connect() -> io::Result<UnixStream> {
     let s = UnixStream::connect(socket_path())?;
-    s.set_read_timeout(Some(Duration::from_secs(30)))?;
-    s.set_write_timeout(Some(Duration::from_secs(5)))?;
+    s.set_read_timeout(Some(FIRST_REPLY))?;
+    s.set_write_timeout(Some(Duration::from_secs(3)))?;
     Ok(s)
 }
 
@@ -148,6 +155,7 @@ pub fn query(scope: &[u8], text: &str, regex: bool, limit: u32, order: u8, first
     match r.u8()? {
         OK => {
             let total = r.u64()? as usize;
+            s.set_read_timeout(Some(NEXT_CHUNK))?;
             let mut rest = Stream { s: Some(s), dirs: Vec::new() };
             let rows = rest.chunk(&body, true)?;
             Ok(Reply::Rows { rows, total, rest })

@@ -170,7 +170,10 @@ struct Space {
 }
 
 enum Msg {
-    Listing { generation: u64, result: Result<Vec<Row>, String>, took: Duration },
+    /// A folder's listing, and the watcher started just before it was read.
+    Listing { generation: u64, result: Result<Vec<Row>, String>, took: Duration, watcher: Option<Watcher> },
+    /// Files read from the clipboard, to paste into `dest`.
+    Paste { files: Vec<Vec<u8>>, cut: bool, dest: Vec<u8>, seq: u32 },
     Changes { generation: u64, changes: Vec<Change> },
     Built(Option<Index>),
     /// The first rows of a search (all of them for in-process searches).
@@ -448,6 +451,9 @@ pub struct App {
     daemon: Option<proto::Status>,
     /// It failed a query; use the in-process index until its next status.
     daemon_failed: bool,
+    /// It didn't answer a query at all: don't ask it again before this,
+    /// whatever its status says (each try would cost the user a timeout).
+    daemon_retry_at: Option<Instant>,
 
     focus: Option<usize>,
     anchor: Option<usize>,
@@ -508,6 +514,8 @@ pub struct App {
     /// The window title last sent, so it is only set when it changes.
     title: String,
     font: Option<String>,
+    /// When recent frames panicked (see `recover`).
+    panics: Vec<Instant>,
 }
 
 impl App {
@@ -563,6 +571,7 @@ impl App {
             build: None,
             daemon: None,
             daemon_failed: false,
+            daemon_retry_at: None,
             focus: None,
             anchor: None,
             pending_select: None,
@@ -607,6 +616,7 @@ impl App {
             elevated: sys::uid() == 0,
             title: String::new(),
             font: None,
+            panics: Vec::new(),
         };
         app.show_hidden = session.show_hidden;
         app.recursive = session.recursive;
@@ -618,7 +628,7 @@ impl App {
             app.tabs = tabs.into_iter().map(|location| Tab { location, back: Vec::new(), forward: Vec::new() }).collect();
             app.tabs[app.active_tab].location = cwd.clone();
         }
-        ui::load_fonts(&app.ctx, app.tx.clone());
+        ui::load_fonts(&app.ctx, app.tx.clone(), String::new());
         app.watch_daemon();
         app.watch_volumes();
         thread::spawn(archive::clean_cache);
@@ -648,11 +658,22 @@ impl App {
     fn watch_daemon(&self) {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         thread::spawn(move || {
+            // Only a change in what the window shows earns a repaint; the
+            // rest (counts in tooltips) is picked up by the next frame.
+            let mut shown: Option<(bool, Vec<u8>, String, u32)> = None;
+            let mut first = true;
             loop {
-                if tx.send(Msg::Daemon(proto::status().ok())).is_err() {
+                let st = proto::status().ok();
+                let now = st.as_ref().map(|s| (s.ready, s.root.clone(), s.paused.clone(), s.watched));
+                let changed = first || now != shown;
+                first = false;
+                shown = now;
+                if tx.send(Msg::Daemon(st)).is_err() {
                     return;
                 }
-                ctx.request_repaint();
+                if changed {
+                    ctx.request_repaint();
+                }
                 thread::sleep(Duration::from_secs(5));
             }
         });
@@ -700,7 +721,10 @@ impl App {
     }
 
     fn daemon_covers(&self, path: &[u8]) -> bool {
-        is_real(path) && !self.daemon_failed && self.daemon.as_ref().is_some_and(|d| d.ready && fsys::in_scope(path, &d.root))
+        is_real(path)
+            && !self.daemon_failed
+            && self.daemon_retry_at.is_none_or(|t| Instant::now() >= t)
+            && self.daemon.as_ref().is_some_and(|d| d.ready && fsys::in_scope(path, &d.root))
     }
 
     /// Run blocking work off the UI thread; a returned message is
@@ -798,10 +822,10 @@ impl App {
             .filter(|(_, r)| (hidden || !r.is_hidden()) && filter.as_ref().is_none_or(|m| m.is_match_entry(&r.name, r.is_dir())))
             .map(|(i, _)| i)
             .collect();
-        self.focus = keep.and_then(|k| (0..self.view.len()).find(|&vi| self.row(vi).is_some_and(|r| r.full_path(&self.cwd) == k)));
+        self.focus = keep.and_then(|k| (0..self.view.len()).find(|&vi| self.row(vi).is_some_and(|r| r.path_is(&self.cwd, &k))));
         self.anchor = self.focus;
         if let Some(want) = self.pending_select.clone()
-            && let Some(vi) = (0..self.view.len()).find(|&vi| self.row(vi).is_some_and(|r| r.full_path(&self.cwd) == want))
+            && let Some(vi) = (0..self.view.len()).find(|&vi| self.row(vi).is_some_and(|r| r.path_is(&self.cwd, &want)))
         {
             self.pending_select = None;
             self.select_only(vi);
@@ -1005,17 +1029,20 @@ impl App {
         self.loading = true;
         self.error = None;
         self.early_changes.clear();
-        // Watch from the start, so nothing between listing and watching is missed.
-        self.watcher = is_real(&self.cwd).then(|| {
-            let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-            watch::watch(self.cwd.clone(), move |changes| {
-                let _ = tx.send(Msg::Changes { generation, changes });
-                ctx.request_repaint();
-            })
-        }).flatten();
+        self.watcher = None;
         let (path, tx, ctx) = (self.cwd.clone(), self.tx.clone(), self.ctx.clone());
         thread::spawn(move || {
             let t = Instant::now();
+            // Watch from the start, so nothing between listing and watching
+            // is missed. Here, not on the UI thread: adding a watch resolves
+            // the path, which can hang on an unreachable network mount.
+            let watcher = is_real(&path).then(|| {
+                let (tx, ctx) = (tx.clone(), ctx.clone());
+                watch::watch(path.clone(), move |changes| {
+                    let _ = tx.send(Msg::Changes { generation, changes });
+                    ctx.request_repaint();
+                })
+            }).flatten();
             // A panic here would leave the folder "Loading…" forever.
             let result = catch_unwind(AssertUnwindSafe(|| {
                 if path == RECENT {
@@ -1027,7 +1054,7 @@ impl App {
                 }
             }))
             .unwrap_or_else(|_| Err("Internal error while listing this folder".into()));
-            let _ = tx.send(Msg::Listing { generation, result, took: t.elapsed() });
+            let _ = tx.send(Msg::Listing { generation, result, took: t.elapsed(), watcher });
             ctx.request_repaint();
         });
     }
@@ -1273,8 +1300,15 @@ impl App {
         if !accepts_files(&dest) {
             return;
         }
-        let Some((files, cut)) = clip::get_files() else { return };
-        let seq = clip::sequence();
+        // Asking the clipboard's owner can take a while (or time out):
+        // off the UI thread.
+        self.spawn_io(move || {
+            let (files, cut) = clip::get_files()?;
+            Some(Msg::Paste { files, cut, dest, seq: clip::sequence() })
+        });
+    }
+
+    fn paste_files(&mut self, files: Vec<Vec<u8>>, cut: bool, dest: Vec<u8>, seq: u32) {
         if let Some(job) = self.start_job(if cut { Kind::Move } else { Kind::Copy }, files, dest)
             && cut
         {
@@ -1507,9 +1541,18 @@ impl App {
                 !removed.contains(&(i - 1))
             });
         }
-        for row in added {
-            let pos = self.rows.partition_point(|r| fsys::cmp_rows(r, &row, self.sort, self.descending).is_lt());
-            self.rows.insert(pos, row);
+        if added.len() > 64 {
+            // Many at once (an extraction, a big copy landing): one sort
+            // beats shifting the listing once per new row.
+            self.rows.extend(added);
+            if self.cwd != RECENT {
+                fsys::sort_rows_par(&mut self.rows, self.sort, self.descending);
+            }
+        } else {
+            for row in added {
+                let pos = self.rows.partition_point(|r| fsys::cmp_rows(r, &row, self.sort, self.descending).is_lt());
+                self.rows.insert(pos, row);
+            }
         }
         if !self.in_results() {
             self.rebuild_view(keep);
@@ -1701,8 +1744,9 @@ impl App {
     fn drain_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Listing { generation, result, took } if generation == self.listing_gen => {
+                Msg::Listing { generation, result, took, watcher } if generation == self.listing_gen => {
                     self.loading = false;
+                    self.watcher = watcher;
                     self.listed_in = took;
                     // On refresh, keep what was selected.
                     let keep: HashSet<Box<[u8]>> = self.rows.iter().filter(|r| r.sel).map(|r| r.name.clone()).collect();
@@ -1793,18 +1837,20 @@ impl App {
                 }
                 Msg::Meta { generation, filled } if generation == self.query_gen.load(Relaxed) => self.apply_meta(filled),
                 Msg::Fonts(name) => self.font = name,
+                Msg::Paste { files, cut, dest, seq } => self.paste_files(files, cut, dest, seq),
                 Msg::Daemon(st) => {
                     self.daemon_failed = false;
                     self.daemon = st;
                 }
                 Msg::DaemonFailed { generation, definitive } if generation == self.query_gen.load(Relaxed) => {
-                    if definitive {
-                        self.daemon_failed = true;
-                        self.start_search();
-                    } else {
-                        self.searching = false;
-                        self.search_error = Some("The index daemon didn't answer; search again in a moment.".into());
+                    // Fall back to searching in-process until the daemon's
+                    // next good status.
+                    self.daemon_failed = true;
+                    if !definitive {
+                        self.daemon_retry_at = Some(Instant::now() + Duration::from_secs(60));
+                        self.notice = Some("The index daemon isn't answering; searching this folder directly".into());
                     }
+                    self.start_search();
                 }
                 Msg::Volumes(volumes) => {
                     self.space.retain(|p, _| volumes.iter().any(|v| v.point == *p));
@@ -1847,7 +1893,7 @@ impl App {
                     let cwd = self.cwd.clone();
                     let rows = self.rows.iter_mut().chain(self.results.iter_mut().flat_map(|r| r.rows.iter_mut()));
                     for r in rows {
-                        if r.full_path(&cwd) == old_path {
+                        if r.path_is(&cwd, &old_path) {
                             r.name = new_name.clone().into();
                         }
                     }
@@ -2141,7 +2187,8 @@ impl App {
         let starts = |r: &Row| r.display().chars().next().map(fold) == Some(first);
         let repeated = text.chars().map(fold).all(|c| c == first);
         let n = self.view.len();
-        let whole_prefix = |r: &Row| r.display().to_lowercase().starts_with(&text.to_lowercase());
+        let lower = text.to_lowercase();
+        let whole_prefix = |r: &Row| r.display().to_lowercase().starts_with(&lower);
         let found: Option<(usize, Vec<usize>)> = if repeated && (text.chars().count() == 1 || !(0..n).any(|vi| self.row(vi).is_some_and(whole_prefix))) {
             let from = match self.focus {
                 Some(f) if self.row(f).is_some_and(starts) => f + 1,
@@ -2310,6 +2357,18 @@ impl App {
         }
     }
 
+    /// Time until the next finished job fades out of the jobs panel.
+    fn next_dismissal(&self) -> Option<Duration> {
+        self.jobs
+            .iter()
+            .filter(|j| j.phase() == Phase::Done && j.error_count() == 0)
+            .filter_map(|j| {
+                let took = (*j.elapsed.lock().unwrap_or_else(std::sync::PoisonError::into_inner))?;
+                Some((took + ui::JOB_LINGER).saturating_sub(j.started.elapsed()) + Duration::from_millis(50))
+            })
+            .min()
+    }
+
     /// Start dragging files out to another program (see xdnd.rs).
     fn drag_out(&mut self, paths: Vec<Vec<u8>>) {
         self.spawn_io(move || match xdnd::drag_files(&paths) {
@@ -2391,6 +2450,43 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // A bug must not take the window (and whatever the user was doing)
+        // down with it: the frame is abandoned, the details go to the crash
+        // log (the panic hook), and the window carries on.
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.frame(ui))) {
+            self.recover(panic);
+        }
+    }
+}
+
+impl App {
+    /// After a panic in a frame: drop what was in progress, say so briefly,
+    /// and, if it keeps happening, go back to a plain view of the home folder.
+    fn recover(&mut self, panic: Box<dyn std::any::Any + Send>) {
+        let text = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
+        let now = Instant::now();
+        self.panics.retain(|t| now.duration_since(*t) < Duration::from_secs(10));
+        self.panics.push(now);
+        self.drag = None;
+        self.band = None;
+        self.renaming = None;
+        self.tab_drag = None;
+        self.typeahead = None;
+        self.props = None;
+        self.scroll_to = Some(0);
+        let mut msg = format!("Internal error: {text} — details in ~/.local/state/fex/crash.log");
+        if self.panics.len() >= 3 {
+            self.panics.clear();
+            self.query.clear();
+            self.clear_search();
+            self.navigate(sys::home(), false);
+            msg.push_str("; FEx reset the view");
+        }
+        self.error = Some(msg);
+        self.ctx.request_repaint();
+    }
+
+    fn frame(&mut self, ui: &mut egui::Ui) {
         self.drain_messages();
         if let Some(t) = self.query_dirty {
             let waited = t.elapsed();
@@ -2440,8 +2536,8 @@ impl eframe::App for App {
         if self.build.is_some() || self.jobs.iter().any(|j| !j.finished()) {
             // Progress counters live in atomics; tick the UI.
             ctx.request_repaint_after(Duration::from_millis(100));
-        } else if !self.jobs.is_empty() {
-            ctx.request_repaint_after(Duration::from_secs(1)); // auto-dismiss timer
+        } else if let Some(wait) = self.next_dismissal() {
+            ctx.request_repaint_after(wait); // auto-dismiss timer
         }
         // Only when it changes: each title command is a round trip to the X server.
         let title = format!("FEx — {}", lossy(&self.cwd));

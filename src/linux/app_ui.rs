@@ -9,6 +9,9 @@ use eframe::egui::{self, Align, Align2, Button, Color32, FontId, Key, Layout, Po
 
 use super::*;
 
+/// How long a finished, clean transfer stays in the jobs panel.
+pub(super) const JOB_LINGER: Duration = Duration::from_secs(8);
+
 impl App {
     pub(super) fn draw(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         if self.elevated {
@@ -499,10 +502,12 @@ impl App {
                 let hidden = if hidden > 0 && !self.show_hidden && self.matcher.is_none() { format!("\n{hidden} hidden (Ctrl+H shows them)") } else { String::new() };
                 resp.on_hover_text(format!("Listed in {:.1} ms{hidden}", self.listed_in.as_secs_f64() * 1e3));
             }
-            let sel = self.selected();
-            if !sel.is_empty() {
-                let bytes: u64 = sel.iter().filter(|r| !r.is_dir()).map(|r| r.size).sum();
-                ui.weak(format!("· {} selected, {}", sel.len(), fsys::format_size(bytes)));
+            let (count, bytes) = {
+                let src = self.source();
+                self.view.iter().filter_map(|&i| src.get(i)).filter(|r| r.sel).fold((0usize, 0u64), |(n, b), r| (n + 1, b + if r.is_dir() { 0 } else { r.size }))
+            };
+            if count > 0 {
+                ui.weak(format!("· {count} selected, {}", fsys::format_size(bytes)));
             }
             if let Some(e) = self.search_error.as_ref().or(self.error.as_ref()) {
                 ui.colored_label(RED, format!("· {e}"));
@@ -602,7 +607,7 @@ impl App {
         }
         // Clean, finished jobs fade out on their own after a few seconds.
         for (n, job) in self.jobs.iter().enumerate() {
-            let old = job.elapsed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some_and(|e| job.started.elapsed() > e + Duration::from_secs(8));
+            let old = job.elapsed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some_and(|e| job.started.elapsed() > e + JOB_LINGER);
             if job.phase() == Phase::Done && job.error_count() == 0 && old && !dismiss.contains(&n) {
                 dismiss.push(n);
             }
@@ -1236,29 +1241,100 @@ pub(super) fn install_style(ctx: &egui::Context) {
 /// rarely has them all; fontconfig names a font for each that does.
 const ICON_GLYPHS: &str = "▲▼⏏☰✕↗⬅➡⬆⟳⚠◷🗀🗋🖴🖧🏠🔍🗐";
 
-/// The desktop's UI font, and fallback fonts for the interface's symbols
-/// (as Windows uses Segoe UI Symbol), found through fontconfig and loaded
-/// off the UI thread. egui's own fonts stay last for anything else.
-pub(super) fn load_fonts(ctx: &egui::Context, tx: Sender<Msg>) {
-    let ctx = ctx.clone();
-    std::thread::spawn(move || {
-        let fc = |pattern: &str| -> Option<String> {
-            let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
-            let f = String::from_utf8_lossy(&out.stdout).into_owned();
-            // egui renders TrueType/OpenType outlines; color bitmap emoji fonts can't be drawn.
-            let usable = (f.ends_with(".ttf") || f.ends_with(".otf")) && !f.to_ascii_lowercase().contains("color");
-            usable.then_some(f)
-        };
-        let ui_font = fc("sans-serif");
-        let mut symbol_fonts: Vec<String> = Vec::new();
-        for c in ICON_GLYPHS.chars() {
-            if let Some(f) = fc(&format!("sans-serif:charset={:x}", c as u32))
-                && Some(&f) != ui_font.as_ref()
-                && !symbol_fonts.contains(&f)
-            {
-                symbol_fonts.push(f);
+/// Where font lookups are remembered between runs.
+fn font_cache_path() -> std::path::PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(sys::os(&sys::home())).join(".cache"))
+        .join("fex/fonts")
+}
+
+/// Changes whenever fonts or fontconfig's setup may have: the modification
+/// times of the font and fontconfig folders (fc-cache touches its cache
+/// folders when fonts are installed), and what was asked for.
+fn font_fingerprint(family: &str) -> String {
+    let home = std::path::PathBuf::from(sys::os(&sys::home()));
+    let mut dirs: Vec<std::path::PathBuf> = ["/etc/fonts", "/etc/fonts/conf.d", "/usr/share/fonts", "/usr/local/share/fonts", "/var/cache/fontconfig"].iter().map(Into::into).collect();
+    for d in [".config/fontconfig", ".local/share/fonts", ".fonts", ".cache/fontconfig"] {
+        dirs.push(home.join(d));
+    }
+    let mut out = format!("v1 {} {family}", env!("CARGO_PKG_VERSION"));
+    for d in dirs {
+        let t = std::fs::metadata(&d).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |t| t.as_nanos());
+        out.push_str(&format!(" {t}"));
+    }
+    out
+}
+
+/// The UI font and the symbol fonts for `family`, through fontconfig (one
+/// `fc-match` per symbol, so remembered in `font_cache_path`).
+fn find_fonts(family: &str) -> (Option<String>, Vec<String>) {
+    let cache = font_cache_path();
+    let fingerprint = font_fingerprint(family);
+    if let Ok(text) = std::fs::read_to_string(&cache) {
+        let mut lines = text.lines();
+        if lines.next() == Some(fingerprint.as_str()) {
+            let (mut ui_font, mut symbols, mut ok) = (None, Vec::new(), true);
+            for line in lines {
+                match line.split_once('\t') {
+                    Some(("ui", f)) => ui_font = Some(f.to_string()),
+                    Some(("sym", f)) => symbols.push(f.to_string()),
+                    _ => {}
+                }
+            }
+            for f in ui_font.iter().chain(&symbols) {
+                ok &= std::path::Path::new(f).exists();
+            }
+            if ok {
+                return (ui_font, symbols);
             }
         }
+    }
+    let fc = |pattern: &str| -> Option<String> {
+        let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
+        let f = String::from_utf8_lossy(&out.stdout).into_owned();
+        // egui renders TrueType/OpenType outlines; color bitmap emoji fonts can't be drawn.
+        let usable = (f.ends_with(".ttf") || f.ends_with(".otf")) && !f.to_ascii_lowercase().contains("color");
+        usable.then_some(f)
+    };
+    let ui_font = fc(family);
+    let mut symbols: Vec<String> = Vec::new();
+    for c in ICON_GLYPHS.chars() {
+        if let Some(f) = fc(&format!("sans-serif:charset={:x}", c as u32))
+            && Some(&f) != ui_font.as_ref()
+            && !symbols.contains(&f)
+        {
+            symbols.push(f);
+        }
+    }
+    let mut text = format!("{fingerprint}\n");
+    if let Some(f) = &ui_font {
+        text.push_str(&format!("ui\t{f}\n"));
+    }
+    for f in &symbols {
+        text.push_str(&format!("sym\t{f}\n"));
+    }
+    if let Some(dir) = cache.parent()
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        let tmp = cache.with_extension("tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &cache);
+        }
+    }
+    (ui_font, symbols)
+}
+
+/// The desktop's UI font (or the one chosen in Appearance), and fallback
+/// fonts for the interface's symbols (as Windows uses Segoe UI Symbol),
+/// found through fontconfig and loaded off the UI thread. egui's own fonts
+/// stay last for anything else.
+pub(super) fn load_fonts(ctx: &egui::Context, tx: Sender<Msg>, family: String) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let family = if family.trim().is_empty() { "sans-serif".to_string() } else { family };
+        let (ui_font, symbol_fonts) = find_fonts(&family);
         let mut fonts = egui::FontDefinitions::default();
         let mut names = Vec::new();
         for (i, file) in ui_font.iter().chain(symbol_fonts.iter()).enumerate() {

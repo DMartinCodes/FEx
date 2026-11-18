@@ -50,6 +50,20 @@ impl Row {
         join(self.dir.as_deref().unwrap_or(cwd), &self.name)
     }
 
+    /// `full_path(cwd) == path`, without building the path (views of big
+    /// result sets compare every row).
+    pub fn path_is(&self, cwd: &[u8], path: &[u8]) -> bool {
+        let dir = self.dir.as_deref().unwrap_or(cwd);
+        let Some(rest) = path.strip_prefix(dir) else { return false };
+        let rest = if dir.ends_with(b"/") { rest } else {
+            match rest.strip_prefix(b"/") {
+                Some(r) => r,
+                None => return false,
+            }
+        };
+        rest == &*self.name
+    }
+
     pub fn type_name(&self) -> String {
         if self.is_dir() {
             return if self.is_link() { "Folder link" } else { "Folder" }.into();
@@ -425,6 +439,16 @@ mod tests {
         sort_rows_par(&mut rows, SortKey::Size, true);
         let key = |r: &Row| (r.flags, r.size, r.name.clone());
         assert_eq!(rows.iter().map(key).collect::<Vec<_>>(), want.iter().map(key).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn path_is_matches_full_path() {
+        let row = |dir: Option<&[u8]>, name: &[u8]| Row { name: name.into(), dir: dir.map(Arc::from), size: 0, mtime: 0, flags: 0, sel: false, id: 0 };
+        for (r, cwd) in [(row(None, b"a.txt"), &b"/home/me"[..]), (row(Some(b"/x/y"), b"b"), b"/cwd"), (row(None, b"etc"), b"/")] {
+            assert!(r.path_is(cwd, &r.full_path(cwd)));
+            assert!(!r.path_is(cwd, &[r.full_path(cwd).as_slice(), b"x"].concat()));
+        }
+        assert!(!row(None, b"b").path_is(b"/a", b"/ab"));
     }
 
     #[test]
