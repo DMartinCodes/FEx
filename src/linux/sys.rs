@@ -779,6 +779,51 @@ fn volumes_from(mounts: Vec<Mount>) -> Vec<Mount> {
     out
 }
 
+/// Run `cmd` to completion with `input` on its stdin, collecting its
+/// output, but give up after `limit`: the child is killed and the error
+/// says so. For tools that talk to servers (`gio`), which can wait for a
+/// dead one far longer than anyone would want to watch a spinner.
+pub fn output_within(cmd: &mut std::process::Command, input: Option<&[u8]>, limit: std::time::Duration) -> Result<std::process::Output, String> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let name = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {name}: {e}"))?;
+    if let (Some(mut stdin), Some(data)) = (child.stdin.take(), input) {
+        let _ = stdin.write_all(data);
+    }
+    // Drained on threads, so a chatty child can't fill a pipe and stall.
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{name} gave no answer within {} s (is the server reachable?)", limit.as_secs()));
+            }
+            Err(e) => return Err(format!("{name}: {e}")),
+        }
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+}
+
 /// Open with the desktop's default handler. Returns at once; the child is
 /// reaped on a thread so it never lingers as a zombie.
 pub fn open_with_default(path: &[u8]) -> Result<(), String> {
@@ -865,6 +910,15 @@ mod tests {
         assert!(Dir::open_strict(&b(root.join("link/inner"))).is_err(), "link in the middle");
         assert!(Dir::open(&b(root.join("link/inner"))).is_ok(), "the plain open still follows links");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn slow_commands_are_cut_off() {
+        let t = std::time::Instant::now();
+        let r = output_within(std::process::Command::new("sleep").arg("30"), None, std::time::Duration::from_millis(300));
+        assert!(r.is_err() && t.elapsed() < std::time::Duration::from_secs(3));
+        let out = output_within(&mut std::process::Command::new("cat"), Some(b"hello"), std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(out.stdout, b"hello");
     }
 
     #[test]
