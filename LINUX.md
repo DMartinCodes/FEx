@@ -55,6 +55,12 @@ search below the folder or filter the folder, F1 shortcuts, session restore,
 Properties (with POSIX permissions and ACLs), drives with capacity bars
 (network ones on request) that follow mounts as they come and go.
 
+Robustness: the folder watcher and clipboard reads run off the UI thread
+(an unreachable network mount can't freeze the window), network commands
+(`gio`, `umount`) are cut off after a time limit, and a panic while drawing
+a frame is caught, logged to `~/.local/state/fex/crash.log`, reported in
+the status bar, and the view reset instead of closing the window.
+
 Desktop integration: on first start FEx installs a desktop entry and its
 icon under `~/.local/share` (unless one is installed), so menus, the panel
 and Alt+Tab show its name and logo; its window class is `fex`. Icon glyphs
@@ -115,23 +121,42 @@ stalls (PSI) exceed `--io-limit` (10%), memory is under pressure, or the
 machine is on battery. Queries and index updates run at normal priority, so
 a starved background thread never delays an answer.
 
-**Per-user visibility.** Each client sees only names in folders it could
-list itself:
+**Per-user visibility.** Each client sees only what a crawl run as that
+client could have found: names in folders it can list, reached through
+folders it can list.
 - Identity comes from the kernel (`SO_PEERCRED`, `SO_PEERGROUPS`), never
   from the request; if groups can't be read, only the primary group counts.
-- Query workers take on the client's filesystem identity (fsuid, fsgid,
-  groups: per thread on Linux) and `open()` each folder that has matches.
-  That is the kernel's own check, so ACLs and search permission on every
-  ancestor count exactly. Decisions are cached per query (one check per
-  folder with matches), and hidden matches are left out of the count too.
+- A match is shown only if its folder, and every folder from the search
+  scope down to it, can be listed by the client. Names under an
+  execute-only (`0711`) folder stay private even where the folder holding
+  them is readable.
+- Permission work happens at indexing time: each folder's bit "everyone
+  may list it" (read and search for owner, group and others, and no ACL)
+  is recorded when it is crawled, re-read or swept, and chained down the
+  tree. Folders whose whole chain is public need no check at query time.
+  The bits are kept current by fanotify attribute events (chmod, chown,
+  ACL changes), are cleared if the change queue overflows, and are used
+  only while every indexed filesystem is watched; otherwise, and for
+  every other folder, the check is live.
+- Live checks: query workers take on the client's filesystem identity
+  (fsuid, fsgid, groups: per thread on Linux) and `open()` the folder. That
+  is the kernel's own check, so ACLs and search permission on every
+  ancestor count exactly. Decisions are cached per query, and hidden
+  matches are left out of the count too.
 - Fail closed: a thread that couldn't take on the identity reports nothing.
-- Permission changes apply from the next query (checks are live).
+- The crawl never follows a symbolic link anywhere in a path
+  (`openat2(RESOLVE_NO_SYMLINKS)`, or a verified fallback on older
+  kernels), so swapping a folder for a link can't get another folder's
+  names indexed under it. A subfolder replaced by a different folder of the
+  same name is noticed (its ctime no longer matches) and re-read.
+- One user can hold at most 8 of the 32 connection slots.
 - Not covered: SELinux/AppArmor is evaluated in the daemon's domain, not
   the client's.
 
 Tested with: owner-only folder, group folder (with and without the group),
 world-readable folder with an ACL denying the user, private folder with an
-ACL granting the user, and a world-readable folder inside a private one.
+ACL granting the user, a world-readable folder inside a private one, and a
+readable folder inside an execute-only one (unit test).
 
 **Protocol.** Unix socket `/run/fex/indexd.sock`; see `proto.rs`. Results
 carry names and types; clients stat what they show, as the user.
@@ -190,6 +215,38 @@ Measured (237K entries, `kill -USR1`): resident 37.3 -> 22.1 MB (heap
 20.0 -> 16.3, file-backed 17.3 -> 5.8), queries unaffected. With the floor
 forced to 99%, background work paused at once and a live change was still
 searchable within 6 ms; the daemon stops within about 1.5 s while paused.
+
+**Reliability.** Maintenance runs under a supervisor: if it ever panics,
+the last snapshot is reloaded and maintenance starts over (logged), so the
+daemon never keeps answering from an index nobody updates. Verification
+sweeps and their follow-up crawls run on a background thread and take the
+index lock one batch at a time, so a sweep paused for battery or pressure
+holds no lock and live changes keep being applied. Malloc arenas are
+capped and freed heap is returned once a minute after queries.
+
+Clients give the daemon 3 s for its first reply. One that doesn't answer
+is skipped for a minute and the search runs in-process, with a note in the
+status bar.
+
+## Appearance and layout
+
+☰ → *Appearance and layout…* (saved in `~/.config/fex/appearance.txt`,
+shared by all windows; changes show at once):
+- Theme: dark (default), light, or frosted glass with a tint colour,
+  opacity and blur. Glass needs a see-through window, which is chosen at
+  start, so switching to or from it offers a restart. With a compositor
+  the desktop shows through; KWin (and picom builds that honour
+  `_KDE_NET_WM_BLUR_BEHIND_REGION`) blur it. Without a compositor the
+  tint is painted solid. Only glass asks for a transparent window, so
+  every other theme costs older compositors nothing.
+- Accent colour, interface font (any fontconfig family) and size.
+- What the window shows: back/forward/up, the New button, path bar,
+  search box, status bar (it still appears to report a problem), the
+  sidebar and each of its sections, and the Date, Type, Size and Folder
+  columns. Presets: Everything, Compact, Search only.
+
+Nothing here is evaluated per frame: settings are applied when they
+change, and an idle window uses no CPU in any theme.
 
 ## Design decisions (from the discovery review)
 
