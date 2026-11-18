@@ -476,8 +476,11 @@ pub struct Applied {
 /// index went away or was replaced). Pausing (`pace`) happens between
 /// batches, holding nothing, so a paused sweep never blocks an update or,
 /// behind a waiting update, a query.
+/// Runs its argument on the index, or returns false if it can't (see `sweep_in_batches`).
+pub type WithIndex<'a> = dyn Fn(&mut dyn FnMut(&Index)) -> bool + Sync + 'a;
+
 pub fn sweep_in_batches(
-    with_index: &(dyn Fn(&mut dyn FnMut(&Index)) -> bool + Sync),
+    with_index: &WithIndex<'_>,
     workers: usize,
     cancel: &AtomicBool,
     init: &(dyn Fn() + Sync),
@@ -937,7 +940,7 @@ impl Index {
     pub fn apply(&mut self, mut scans: Vec<DirScan>, skip: &HashSet<Vec<u8>>) -> Applied {
         // Deepest first: a subfolder re-read in the same batch is current by
         // the time its parent compares its ctime.
-        scans.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        scans.sort_by_key(|s| std::cmp::Reverse(s.path.len()));
         let mut pending = Vec::new();
         let mut recheck = Vec::new();
         let mut doomed: HashSet<Vec<u8>> = HashSet::new();

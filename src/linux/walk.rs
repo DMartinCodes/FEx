@@ -87,6 +87,7 @@ pub enum Visit<'a, 'b> {
 /// refuses any path with a symbolic link in it (`Dir::open_strict`), for
 /// crawls made with more privileges than the people who search them.
 /// Returns the states of the workers that finished and how many panicked.
+#[allow(clippy::too_many_arguments)]
 pub fn walk<S: Send>(
     roots: &[Arc<[u8]>],
     workers: usize,
