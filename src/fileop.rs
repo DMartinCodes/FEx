@@ -323,6 +323,58 @@ pub fn ejectable(path: &str) -> bool {
     }
 }
 
+/// What a volume (`\\?\Volume{guid}\`) is, for deciding whether a volume
+/// without a usable drive letter belongs in the sidebar.
+pub struct VolumeFacts {
+    /// Removable media, optical, or a disk on an external bus.
+    pub removable: bool,
+    /// A partition meant to hold user files: not EFI, recovery, or one
+    /// marked "no drive letter" or hidden.
+    pub data: bool,
+}
+
+/// Opens the volume's device without read or write access, which needs no
+/// administrator rights and never mounts it. Call it off the UI thread.
+#[allow(non_upper_case_globals)]
+pub fn volume_facts(volume: &str) -> VolumeFacts {
+    use windows_sys::Win32::Storage::FileSystem::PARTITION_BASIC_DATA_GUID;
+    use windows_sys::Win32::System::Ioctl::{
+        GPT_BASIC_DATA_ATTRIBUTE_HIDDEN, GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER, IOCTL_DISK_GET_PARTITION_INFO_EX,
+        PARTITION_INFORMATION_EX, PARTITION_STYLE_GPT, PARTITION_STYLE_MBR,
+    };
+    let root = format!("{}\\", volume.trim_end_matches('\\'));
+    let mut dev = wide(volume.trim_end_matches('\\'), "");
+    let device = Device::open(dev.as_mut_ptr(), 0).ok();
+    let removable = match drive_type(&root) {
+        DRIVE_REMOVABLE | DRIVE_CDROM => true,
+        DRIVE_FIXED => device
+            .as_ref()
+            .and_then(bus_type)
+            .is_some_and(|bus| matches!(bus, BusTypeUsb | BusType1394 | BusTypeSd | BusTypeMmc)),
+        _ => false,
+    };
+    let mut info = PARTITION_INFORMATION_EX::default();
+    let partition = device.as_ref().and_then(|d| d.control::<(), _>(IOCTL_DISK_GET_PARTITION_INFO_EX, None, Some(&mut info)).ok());
+    let data = match (partition, info.PartitionStyle) {
+        (Some(_), PARTITION_STYLE_GPT) => {
+            let gpt = unsafe { info.Anonymous.Gpt };
+            let basic = gpt.PartitionType.data1 == PARTITION_BASIC_DATA_GUID.data1
+                && gpt.PartitionType.data2 == PARTITION_BASIC_DATA_GUID.data2
+                && gpt.PartitionType.data3 == PARTITION_BASIC_DATA_GUID.data3
+                && gpt.PartitionType.data4 == PARTITION_BASIC_DATA_GUID.data4;
+            basic && gpt.Attributes & (GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER | GPT_BASIC_DATA_ATTRIBUTE_HIDDEN) == 0
+        }
+        // FAT12/16/32, exFAT/NTFS (0x07); hidden, EFI (0xEF) and recovery types are left out.
+        (Some(_), PARTITION_STYLE_MBR) => {
+            let mbr = unsafe { info.Anonymous.Mbr };
+            matches!(mbr.PartitionType, 0x01 | 0x04 | 0x06 | 0x07 | 0x0B | 0x0C | 0x0E)
+        }
+        // Media without a partition table (floppies, some card formats, discs).
+        _ => true,
+    };
+    VolumeFacts { removable, data }
+}
+
 /// The disk device instance holding volume device number `number`.
 fn disk_instance(number: &STORAGE_DEVICE_NUMBER) -> Option<u32> {
     unsafe {

@@ -22,6 +22,8 @@ pub struct NetState {
 pub struct MapDialog {
     remote: String,
     letters: Vec<char>,
+    /// Letters Windows keeps for removable drives that aren't plugged in.
+    reserved: Vec<char>,
     letter: char,
     persistent: bool,
     prompt: bool,
@@ -76,8 +78,12 @@ impl FexApp {
 
     fn open_map_dialog(&mut self, remote: String) {
         let letters = net::free_letters();
-        let letter = letters.last().copied().unwrap_or('Z'); // Explorer also offers the highest free letter
-        self.net.map = Some(MapDialog { remote, letters, letter, persistent: true, prompt: false, error: None });
+        // A mapping on a letter Windows keeps for a USB drive hides that
+        // drive the next time it is plugged in, so those come last.
+        let reserved = crate::volumes::reserved_letters(None);
+        // Explorer also offers the highest free letter.
+        let letter = letters.iter().rev().find(|l| !reserved.contains(l)).or(letters.last()).copied().unwrap_or('Z');
+        self.net.map = Some(MapDialog { remote, letters, reserved, letter, persistent: true, prompt: false, error: None });
     }
 
     pub(super) fn map_dialog(&mut self, ctx: &egui::Context) {
@@ -94,8 +100,11 @@ impl FexApp {
                 ui.end_row();
                 ui.label("Drive");
                 egui::ComboBox::from_id_salt("map_letter").selected_text(format!("{}:", d.letter)).show_ui(ui, |ui| {
-                    for &l in d.letters.iter().rev() {
+                    for &l in d.letters.iter().rev().filter(|l| !d.reserved.contains(l)) {
                         ui.selectable_value(&mut d.letter, l, format!("{l}:"));
+                    }
+                    for &l in d.letters.iter().rev().filter(|l| d.reserved.contains(l)) {
+                        ui.selectable_value(&mut d.letter, l, format!("{l}:  (kept for a removable drive)"));
                     }
                 });
                 ui.end_row();

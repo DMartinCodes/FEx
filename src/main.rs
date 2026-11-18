@@ -43,6 +43,8 @@ mod update;
 #[cfg(windows)]
 mod walk;
 #[cfg(windows)]
+mod volumes;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod win;

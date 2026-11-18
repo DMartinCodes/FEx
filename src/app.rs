@@ -27,6 +27,8 @@ use windows_sys::Win32::Foundation::HWND;
 
 #[path = "netview.rs"]
 mod netview;
+#[path = "driveview.rs"]
+mod driveview;
 
 /// Search results materialized for display; the total count is still exact.
 const MAX_RESULTS: usize = 250_000;
@@ -115,8 +117,14 @@ enum Msg {
     ServiceFailed { generation: u64, definitive: bool },
     /// Segoe UI Emoji, loaded after startup (it's 13 MB).
     EmojiFont(Vec<u8>),
-    DriveSpace { path: String, is_network: bool, queried: bool, ejectable: bool, result: Option<(u64, u64)> },
+    /// `target`: what the letter pointed to when asked; a reply about a
+    /// drive that has since been swapped is dropped.
+    DriveSpace { path: String, target: Option<String>, is_network: bool, queried: bool, ejectable: bool, result: Option<(u64, u64)> },
     DriveEjected(String),
+    /// Drive letters and volumes changed (or were read on request).
+    Volumes(crate::volumes::Snapshot),
+    /// An "Assign drive letter" finished.
+    LetterAssigned { result: Result<(), String>, letter: char },
     ShellNewItems(Vec<crate::shellnew::Item>),
     VirtualDropDone { dir: String, created: Vec<String>, errors: Vec<String> },
     RecentChanged,
@@ -136,6 +144,7 @@ enum Msg {
     NetDone { result: Result<(), String>, open: Option<String> },
 }
 
+#[derive(Clone)]
 enum Action {
     Click { vi: usize, ctrl: bool, shift: bool },
     Secondary(usize),
@@ -148,6 +157,8 @@ enum Action {
     ExtractSelected,
     CreateLink(usize),
     EjectDrive(String),
+    /// Give a volume another drive letter; `current` is its letter, if any.
+    ChangeLetter { volume: String, name: String, current: Option<char>, why: Option<String> },
     RunAs(usize),
     OpenLocation(usize),
     CopyPath(usize),
@@ -320,6 +331,9 @@ pub struct FexApp {
     path_editing: bool,
 
     drives: Vec<String>,
+    /// What each letter is in this session, and volumes no letter reaches.
+    volumes: crate::volumes::Snapshot,
+    letter_dialog: Option<driveview::LetterDialog>,
     drive_space: HashMap<String, DriveSpace>,
     drive_space_pending: HashSet<String>,
     report_network_space: bool,
@@ -365,6 +379,7 @@ impl FexApp {
             None => app.error = Some("Dropping files into FEx is unavailable (no window handle)".into()),
         }
         thread::spawn(archive::clean_cache);
+        app.watch_drives();
         let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
         app.spawn_io(move || std::fs::read(format!(r"{windir}\Fonts\seguiemj.ttf")).ok().map(Msg::EmojiFont));
         app
@@ -455,6 +470,8 @@ impl FexApp {
             maximized: false,
             path_editing: false,
             drives: win::drives(),
+            volumes: Default::default(),
+            letter_dialog: None,
             drive_space: HashMap::new(),
             drive_space_pending: HashSet::new(),
             report_network_space: false,
@@ -813,7 +830,7 @@ impl FexApp {
     }
 
     fn refresh(&mut self) {
-        self.drives = win::drives();
+        self.rescan_drives();
         self.refresh_connections();
         if self.cwd == NETWORK {
             self.open_network_page();
@@ -1738,12 +1755,16 @@ impl FexApp {
                         .collect();
                     self.ctx.add_font(egui::FontInsert::new("seguiemj.ttf", egui::FontData::from_owned(bytes), families));
                 }
-                Msg::DriveSpace { path, is_network, queried, ejectable, result } => {
+                Msg::DriveSpace { path, target, is_network, queried, ejectable, result } => {
                     self.drive_space_pending.remove(&path);
-                    self.drive_space.insert(path, DriveSpace { is_network, queried, ejectable, capacity: result, checked: Instant::now() });
+                    if self.volumes.letter(&path).map(|d| &d.target) == target.as_ref() {
+                        self.drive_space.insert(path, DriveSpace { is_network, queried, ejectable, capacity: result, checked: Instant::now() });
+                    }
                 }
+                Msg::Volumes(snapshot) => self.set_volumes(snapshot),
+                Msg::LetterAssigned { result, letter } => self.letter_assigned(result, letter),
                 Msg::DriveEjected(path) => {
-                    self.drives = win::drives();
+                    self.rescan_drives();
                     self.drive_space.remove(&path);
                     self.notice = Some(format!("You can now safely remove {path}"));
                 }
@@ -1844,7 +1865,7 @@ impl FexApp {
                 }
                 Msg::NetDone { result, open } => {
                     self.net.busy = false;
-                    self.drives = win::drives();
+                    self.rescan_drives();
                     self.refresh_connections();
                     match (result, open) {
                         (Ok(()), Some(path)) => self.navigate(path, true),
@@ -1909,7 +1930,7 @@ impl FexApp {
                 self.switch_tab(if n == 8 { self.tabs.len() - 1 } else { n });
             }
         }
-        if typing || self.confirm_delete.is_some() || self.net.map.is_some() || self.jobs.iter().any(|j| j.phase() == Phase::AwaitingDecision) {
+        if typing || self.confirm_delete.is_some() || self.net.map.is_some() || self.letter_dialog.is_some() || self.jobs.iter().any(|j| j.phase() == Phase::AwaitingDecision) {
             return;
         }
         if self.cwd == NETWORK {
@@ -2280,24 +2301,45 @@ impl FexApp {
             return;
         }
         self.drive_space_pending.insert(path.to_string());
-        let (path, failed) = (path.to_string(), path.to_string());
+        let target = self.volumes.letter(path).map(|d| d.target.clone());
+        let (path, failed, failed_target) = (path.to_string(), path.to_string(), target.clone());
         self.spawn_io_or(
             move || {
                 let is_network = known_network || fileop::is_network(&path);
                 let queried = !is_network || report_network;
                 let ejectable = !is_network && fileop::ejectable(&path);
                 let result = queried.then(|| win::drive_space(&path)).flatten();
-                Some(Msg::DriveSpace { path, is_network, queried, ejectable, result })
+                Some(Msg::DriveSpace { path, target, is_network, queried, ejectable, result })
             },
-            move |_| Msg::DriveSpace { path: failed, is_network: known_network, queried: true, ejectable: false, result: None },
+            move |_| Msg::DriveSpace {
+                path: failed,
+                target: failed_target,
+                is_network: known_network,
+                queried: true,
+                ejectable: false,
+                result: None,
+            },
         );
+    }
+
+    /// The mapped connection shown for drive `root`. What the letter points
+    /// to in this session decides: a local drive on a letter that is also
+    /// remembered for a disconnected mapping (Windows gave a USB drive that
+    /// letter) is not a network drive.
+    fn mapping_of(&self, root: &str) -> Option<&net::Connection> {
+        let on_letter = |c: &&net::Connection| c.local.as_deref().is_some_and(|l| root.starts_with(l));
+        match self.volumes.letter(root).map(|d| d.network.is_some()) {
+            Some(false) => None,
+            Some(true) => self.net.connections.iter().find(on_letter),
+            None => self.net.connections.iter().filter(|c| c.connected).find(on_letter),
+        }
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
         let drives = self.drives.clone();
-        let network_drives: HashSet<String> = self.net.connections.iter().filter_map(|c| c.local.clone()).collect();
+        let hidden = self.volumes.hidden.clone();
         for drive in &drives {
-            let known_network = network_drives.iter().any(|local| drive.starts_with(local));
+            let known_network = self.mapping_of(drive).is_some() || self.volumes.letter(drive).is_some_and(|d| d.network.is_some());
             self.request_drive_space(drive, self.report_network_space, known_network);
         }
         let mut target = None;
@@ -2333,19 +2375,34 @@ impl FexApp {
             ui.add_space(8.0);
             ui.weak("Drives");
             for d in &drives {
-                let mapped = self.net.connections.iter().find(|c| c.local.as_deref().is_some_and(|l| d.starts_with(l)));
-                let is_network = mapped.is_some() || self.drive_space.get(d).is_some_and(|space| space.is_network);
+                let info = self.volumes.letter(d);
+                let remote = self.mapping_of(d).map(|c| c.remote.clone()).or_else(|| info.and_then(|i| i.network.clone()));
+                let is_network = remote.is_some() || self.drive_space.get(d).is_some_and(|space| space.is_network);
                 let include_space = !is_network || self.report_network_space;
-                let (label, tip) = match mapped {
-                    Some(c) => {
-                        let share = c.remote.rsplit('\\').next().unwrap_or("");
-                        (format!("🖧 {d} {share}"), c.remote.as_str())
+                let (label, tip) = match &remote {
+                    Some(r) => {
+                        let share = r.rsplit('\\').next().unwrap_or("");
+                        (format!("🖧 {d} {share}"), r.clone())
                     }
-                    None => (format!("🖴 {d}"), d.as_str()),
+                    None => (format!("🖴 {d}"), d.clone()),
                 };
+                // A remembered mapping that can't reconnect while this drive holds its letter.
+                let clash = info.filter(|i| i.volume.is_some()).and_then(|_| {
+                    self.net.connections.iter().find(|c| !c.connected && c.local.as_deref().is_some_and(|l| d.starts_with(l)))
+                });
                 ui.horizontal(|ui| {
-                    let response = entry(ui, label, d, tip, &self.cwd);
-                    let ejectable = mapped.is_none() && self.drive_space.get(d).is_some_and(|space| space.ejectable);
+                    let response = entry(ui, label, d, &tip, &self.cwd);
+                    let ejectable = remote.is_none() && self.drive_space.get(d).is_some_and(|space| space.ejectable);
+                    let why = clash.map(|c| {
+                        format!("{d} is also remembered for the network drive {}, which can't reconnect while this drive uses the letter.", c.remote)
+                    });
+                    let system = std::env::var("SystemDrive").is_ok_and(|s| d.to_ascii_uppercase().starts_with(&s.to_ascii_uppercase()));
+                    let change = info.and_then(|i| i.volume.clone()).filter(|_| !system && (ejectable || clash.is_some())).map(|volume| Action::ChangeLetter {
+                        volume,
+                        name: d.trim_end_matches('\\').to_string(),
+                        current: d.chars().next(),
+                        why: why.clone(),
+                    });
                     response.context_menu(|ui| {
                         if ui.button("Open in new tab").clicked() {
                             action = Some(Action::OpenInNewTab(d.clone()));
@@ -2355,7 +2412,18 @@ impl FexApp {
                             action = Some(Action::EjectDrive(d.clone()));
                             ui.close();
                         }
+                        if let Some(change) = &change
+                            && ui.button("Change drive letter…").clicked()
+                        {
+                            action = Some(change.clone());
+                            ui.close();
+                        }
                     });
+                    if let (Some(why), Some(change)) = (&why, &change)
+                        && ui.small_button("⚠").on_hover_text(format!("{why}\nClick to give this drive another letter.")).clicked()
+                    {
+                        action = Some(change.clone());
+                    }
                     if ejectable && ui.small_button("⏏").on_hover_text(format!("Safely eject {d}")).clicked() {
                         action = Some(Action::EjectDrive(d.clone()));
                     }
@@ -2377,6 +2445,18 @@ impl FexApp {
                         ));
                     }
                 });
+            }
+            // Drives no letter reaches here: shadowed by a network drive, or never given one.
+            for h in &hidden {
+                let label = match h.letter {
+                    Some(l) => format!("⚠ {} ({l}: is taken)", h.name()),
+                    None => format!("⚠ {} (no letter)", h.name()),
+                };
+                let why = h.reason();
+                let response = ui.selectable_label(false, label).on_hover_text(format!("{why}.\nClick to give it a free drive letter."));
+                if response.clicked() {
+                    action = Some(Action::ChangeLetter { volume: h.volume.clone(), name: h.name(), current: h.letter, why: Some(format!("{why}.")) });
+                }
             }
             ui.add_space(8.0);
             entry(ui, "🖧 Network".into(), &NETWORK.to_string(), "Shares, mapped drives and network scan", &self.cwd);
@@ -3237,6 +3317,7 @@ impl FexApp {
                 }
             }
             Action::EjectDrive(path) => self.eject(path),
+            Action::ChangeLetter { volume, name, current, why } => self.open_letter_dialog(volume, name, current, why),
             Action::RunAs(i) => {
                 self.select_only(i);
                 self.run_as(i);
@@ -3879,6 +3960,7 @@ impl eframe::App for FexApp {
         self.handle_os_drop(&ctx);
         self.dialogs(&ctx);
         self.map_dialog(&ctx);
+        self.letter_dialog(&ctx);
 
         if self.build.is_some() || self.jobs.iter().any(|j| !j.finished()) {
             // Progress counters live in atomics; tick the UI.
