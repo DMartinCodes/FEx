@@ -9,6 +9,9 @@ use eframe::egui::{self, Align, Align2, Button, Color32, FontId, Key, Layout, Po
 
 use super::*;
 
+/// How long a finished, clean transfer stays in the jobs panel.
+pub(super) const JOB_LINGER: Duration = Duration::from_secs(8);
+
 impl App {
     pub(super) fn draw(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         if self.elevated {
@@ -20,7 +23,10 @@ impl App {
         if self.tabs.len() > 1 {
             egui::Panel::top("tabs").show(ui, |ui| self.tab_strip(ui));
         }
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        // A hidden status bar still comes back to report a problem.
+        if self.look.status_bar || self.error.is_some() || self.search_error.is_some() || self.notice.is_some() {
+            egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        }
         if !self.jobs.is_empty() {
             egui::Panel::bottom("jobs").show(ui, |ui| {
                 ui.add_space(2.0);
@@ -28,7 +34,9 @@ impl App {
                 ui.add_space(2.0);
             });
         }
-        egui::Panel::left("sidebar").default_size(190.0).resizable(true).show(ui, |ui| self.sidebar(ui));
+        if self.look.sidebar {
+            egui::Panel::left("sidebar").default_size(190.0).resizable(true).show(ui, |ui| self.sidebar(ui));
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             if self.cwd == NETWORK {
                 self.network_page(ui);
@@ -40,6 +48,7 @@ impl App {
         self.update_tab_drag(ctx);
         self.dialogs(ctx);
         self.net_dialogs(ctx);
+        self.appearance_window(ctx);
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
@@ -48,21 +57,25 @@ impl App {
             let nav = |ui: &mut Ui, enabled: bool, icon: &str, tip: &str| {
                 ui.add_enabled(enabled, Button::new(icon).frame(false).min_size(egui::vec2(22.0, 22.0))).on_hover_text(tip).clicked()
             };
-            if nav(ui, !self.back.is_empty(), "⬅", "Back (Alt+←)") {
-                self.go_back();
-            }
-            if nav(ui, !self.forward.is_empty(), "➡", "Forward (Alt+→)") {
-                self.go_forward();
-            }
-            if nav(ui, parent_of(&self.cwd).is_some(), "⬆", "Up (Alt+↑)") {
-                self.go_up();
+            if self.look.nav_buttons {
+                if nav(ui, !self.back.is_empty(), "⬅", "Back (Alt+←)") {
+                    self.go_back();
+                }
+                if nav(ui, !self.forward.is_empty(), "➡", "Forward (Alt+→)") {
+                    self.go_forward();
+                }
+                if nav(ui, parent_of(&self.cwd).is_some(), "⬆", "Up (Alt+↑)") {
+                    self.go_up();
+                }
             }
             let mut new_action = None;
-            ui.add_enabled_ui(is_real(&self.cwd), |ui| {
-                ui.menu_button("➕", |ui| self.new_menu(ui, &mut new_action))
-                    .response
-                    .on_hover_text("New folder or file (Ctrl+Shift+N, Ctrl+Alt+N)");
-            });
+            if self.look.new_button {
+                ui.add_enabled_ui(is_real(&self.cwd), |ui| {
+                    ui.menu_button("➕", |ui| self.new_menu(ui, &mut new_action))
+                        .response
+                        .on_hover_text("New folder or file (Ctrl+Shift+N, Ctrl+Alt+N)");
+                });
+            }
             if new_action.is_some() {
                 let ctx = ui.ctx().clone();
                 self.run_action(new_action, &ctx);
@@ -75,9 +88,17 @@ impl App {
                     (true, true) => "Search (regex)",
                     (true, false) => "Filter this folder (regex)",
                 };
-                let mut search = TextEdit::singleline(&mut self.query).id(egui::Id::unique("search_bar")).hint_text(hint).desired_width(200.0);
+                // Without the path bar the search box takes the whole row.
+                let width = if self.look.path_bar { 200.0 } else { ui.available_width() };
+                let mut search = TextEdit::singleline(&mut self.query).id(egui::Id::unique("search_bar")).hint_text(hint).desired_width(width);
                 if self.search_error.is_some() {
                     search = search.text_color(RED);
+                }
+                if !self.look.search_bar {
+                    if self.look.path_bar {
+                        self.path_bar(ui);
+                    }
+                    return;
                 }
                 let resp = ui.add(search);
                 let indexed = self.daemon_covers(&self.cwd) || self.indexes.iter().any(|i| i.covers(&self.cwd));
@@ -91,7 +112,9 @@ impl App {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && self.query_dirty.is_some() {
                     self.start_search();
                 }
-                self.path_bar(ui);
+                if self.look.path_bar {
+                    self.path_bar(ui);
+                }
             });
         });
         ui.add_space(3.0);
@@ -130,6 +153,11 @@ impl App {
             self.report_network_space = !self.report_network_space;
         }
         ui.separator();
+        if ui.button("Appearance and layout…").clicked() {
+            self.look_open = true;
+            self.look_font = self.look.font.clone();
+            ui.close();
+        }
         if ui.add(Button::new("Keyboard shortcuts").shortcut_text("F1")).clicked() {
             self.help_open = true;
             ui.close();
@@ -241,9 +269,12 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut Ui) {
         let report_network = self.report_network_space;
-        let wanted: Vec<Vec<u8>> = self.volumes.iter().filter(|v| !v.network || report_network).map(|v| v.point.clone()).collect();
-        for point in &wanted {
-            self.request_space(point);
+        let (show_drives, show_net_drives, show_capacity) = (self.look.drives, self.look.network_drives, self.look.capacity);
+        if show_drives && show_capacity {
+            let wanted: Vec<Vec<u8>> = self.volumes.iter().filter(|v| (!v.network || report_network) && (!v.network || show_net_drives)).map(|v| v.point.clone()).collect();
+            for point in &wanted {
+                self.request_space(point);
+            }
         }
         let mut target = None;
         let mut tab_target = None;
@@ -271,15 +302,19 @@ impl App {
                 resp
             };
             ui.add_space(4.0);
-            ui.weak("Quick access");
-            entry(ui, "◷ Recent".into(), RECENT, "Recently opened files", &self.cwd);
-            for (label, path) in &self.places {
-                let icon = if label == "Home" { "🏠" } else { "🗀" };
-                entry(ui, format!("{icon} {label}"), path, &lossy(path), &self.cwd);
+            if self.look.quick_access {
+                ui.weak("Quick access");
+                entry(ui, "◷ Recent".into(), RECENT, "Recently opened files", &self.cwd);
+                for (label, path) in &self.places {
+                    let icon = if label == "Home" { "🏠" } else { "🗀" };
+                    entry(ui, format!("{icon} {label}"), path, &lossy(path), &self.cwd);
+                }
+                ui.add_space(8.0);
             }
-            ui.add_space(8.0);
-            ui.weak("Drives");
-            for v in &self.volumes {
+            if show_drives {
+                ui.weak("Drives");
+            }
+            for v in self.volumes.iter().filter(|v| show_drives && (!v.network || show_net_drives)) {
                 ui.horizontal(|ui| {
                     let response = entry(ui, v.label.clone(), &v.point, &v.tip, &self.cwd);
                     response.context_menu(|ui| {
@@ -307,7 +342,8 @@ impl App {
                     if v.ejectable && ui.small_button("⏏").on_hover_text(format!("Safely eject {}", lossy(fsys::base_name(&v.point)))).clicked() {
                         action = Some(Action::EjectDrive(v.point.clone()));
                     }
-                    if (!v.network || report_network)
+                    if show_capacity
+                        && (!v.network || report_network)
                         && let Some((free, total)) = self.space.get(&v.point).and_then(|s| s.capacity)
                         && total > 0
                     {
@@ -364,6 +400,12 @@ impl App {
                     .on_disabled_hover_text(tip);
             }
             ui.add_space(8.0);
+            if show_drives {
+                ui.add_space(8.0);
+            }
+            if !self.look.network {
+                return;
+            }
             entry(ui, "🖧 Network".into(), NETWORK, "Connect to shares, browse servers", &self.cwd);
             for s in &self.servers {
                 let label = format!("    {}", s.split_once("://").map_or(s.as_str(), |(_, h)| h));
@@ -547,10 +589,12 @@ impl App {
                 let hidden = if hidden > 0 && !self.show_hidden && self.matcher.is_none() { format!("\n{hidden} hidden (Ctrl+H shows them)") } else { String::new() };
                 resp.on_hover_text(format!("Listed in {:.1} ms{hidden}", self.listed_in.as_secs_f64() * 1e3));
             }
-            let sel = self.selected();
-            if !sel.is_empty() {
-                let bytes: u64 = sel.iter().filter(|r| !r.is_dir()).map(|r| r.size).sum();
-                ui.weak(format!("· {} selected, {}", sel.len(), fsys::format_size(bytes)));
+            let (count, bytes) = {
+                let src = self.source();
+                self.view.iter().filter_map(|&i| src.get(i)).filter(|r| r.sel).fold((0usize, 0u64), |(n, b), r| (n + 1, b + if r.is_dir() { 0 } else { r.size }))
+            };
+            if count > 0 {
+                ui.weak(format!("· {count} selected, {}", fsys::format_size(bytes)));
             }
             if let Some(e) = self.search_error.as_ref().or(self.error.as_ref()) {
                 ui.colored_label(RED, format!("· {e}"));
@@ -650,7 +694,7 @@ impl App {
         }
         // Clean, finished jobs fade out on their own after a few seconds.
         for (n, job) in self.jobs.iter().enumerate() {
-            let old = job.elapsed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some_and(|e| job.started.elapsed() > e + Duration::from_secs(8));
+            let old = job.elapsed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some_and(|e| job.started.elapsed() > e + JOB_LINGER);
             if job.phase() == Phase::Done && job.error_count() == 0 && old && !dismiss.contains(&n) {
                 dismiss.push(n);
             }
@@ -665,9 +709,13 @@ impl App {
         let results = self.in_results();
         let folders = results || self.cwd == RECENT;
         let width = ui.available_width();
-        let (date_w, size_w, type_w) = (140.0, 90.0, if folders { 0.0 } else { 120.0 });
+        let look = &self.look;
+        let (show_date, show_size, show_type, show_folder) = (look.col_date, look.col_size, look.col_type && !folders, look.col_folder && folders);
+        let date_w = if show_date { 140.0 } else { 0.0 };
+        let size_w = if show_size { 90.0 } else { 0.0 };
+        let type_w = if show_type { 120.0 } else { 0.0 };
         let flex = (width - date_w - size_w - type_w).max(120.0);
-        let (name_w, folder_w) = if folders { (flex * 0.45, flex * 0.55) } else { (flex, 0.0) };
+        let (name_w, folder_w) = if show_folder { (flex * 0.45, flex * 0.55) } else { (flex, 0.0) };
         let mut cols: Vec<(&str, Option<SortKey>, f32, f32, bool)> = Vec::new();
         let mut x = 0.0;
         let mut add = |label, key, w, right| {
@@ -675,14 +723,18 @@ impl App {
             x += w;
         };
         add("Name", Some(SortKey::Name), name_w, false);
-        if folders {
+        if show_folder {
             add("Folder", None, folder_w, false);
         }
-        add("Date modified", Some(SortKey::Modified), date_w, false);
-        if !folders {
+        if show_date {
+            add("Date modified", Some(SortKey::Modified), date_w, false);
+        }
+        if show_type {
             add("Type", Some(SortKey::Type), type_w, false);
         }
-        add("Size", Some(SortKey::Size), size_w, true);
+        if show_size {
+            add("Size", Some(SortKey::Size), size_w, true);
+        }
 
         let font = FontId::proportional(13.5);
         let visuals = ui.visuals().clone();
@@ -1153,6 +1205,146 @@ impl App {
         }
     }
 
+    /// Appearance and layout: changes show at once and are saved when the
+    /// window closes. Only a switch to or from a see-through window needs a
+    /// restart (the window system fixes that when the window is made).
+    fn appearance_window(&mut self, ctx: &egui::Context) {
+        use crate::linux::appearance::{Preset, Theme, DEFAULT_ACCENT};
+        if !self.look_open {
+            return;
+        }
+        let mut look = self.look.clone();
+        let mut open = true;
+        let mut restart = false;
+        let mut font_apply = false;
+        egui::Window::new("Appearance and layout")
+            .id(egui::Id::unique("appearance"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Start from:");
+                for (p, label, tip) in [
+                    (Preset::Full, "Everything", "Sidebar, toolbar, status bar and every column"),
+                    (Preset::Compact, "Compact", "No capacity bars, network entries or Type column"),
+                    (Preset::SearchOnly, "Search only", "Just the search box and the results"),
+                ] {
+                    if ui.button(label).on_hover_text(tip).clicked() {
+                        look.apply_preset(p);
+                    }
+                }
+            });
+            ui.separator();
+            egui::Grid::new("look_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                ui.label("Theme");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut look.theme, Theme::Dark, "Dark");
+                    ui.radio_value(&mut look.theme, Theme::Light, "Light");
+                    ui.radio_value(&mut look.theme, Theme::Glass, "Frosted glass");
+                });
+                ui.end_row();
+                ui.label("Accent");
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut look.accent);
+                    if look.accent != DEFAULT_ACCENT && ui.small_button("Reset").clicked() {
+                        look.accent = DEFAULT_ACCENT;
+                    }
+                });
+                ui.end_row();
+                if look.theme == Theme::Glass {
+                    ui.label("Glass tint");
+                    ui.color_edit_button_srgb(&mut look.glass_tint);
+                    ui.end_row();
+                    ui.label("Opacity");
+                    let mut pct = (look.glass_opacity * 100.0).round();
+                    if ui.add(egui::Slider::new(&mut pct, 30.0..=100.0).fixed_decimals(0).suffix("%")).changed() {
+                        look.glass_opacity = pct / 100.0;
+                    }
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut look.glass_blur, "Blur what's behind").on_hover_text("Where the compositor offers it (KDE's KWin, picom with blur); elsewhere the glass stays clear");
+                    ui.end_row();
+                }
+                ui.label("Font");
+                ui.horizontal(|ui| {
+                    let r = ui.add(TextEdit::singleline(&mut self.look_font).hint_text("desktop default").desired_width(170.0));
+                    if (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) || ui.button("Apply").clicked() {
+                        font_apply = true;
+                    }
+                    if !look.font.is_empty() && ui.small_button("Default").clicked() {
+                        self.look_font.clear();
+                        font_apply = true;
+                    }
+                });
+                ui.end_row();
+                ui.label("Size");
+                let mut pct = (look.scale * 100.0).round();
+                // Applied on release: resizing the whole interface mid-drag would move the slider.
+                let r = ui.add(egui::Slider::new(&mut pct, 80.0..=160.0).step_by(5.0).fixed_decimals(0).suffix("%"));
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    look.scale = pct / 100.0;
+                }
+                ui.end_row();
+            });
+            if look.wants_transparency() != self.transparent {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.weak(if look.wants_transparency() { "The window becomes see-through after a restart." } else { "The window becomes opaque again after a restart." });
+                    if ui.button("Restart FEx now").clicked() {
+                        restart = true;
+                    }
+                });
+            }
+            ui.separator();
+            ui.columns(3, |c| {
+                c[0].strong("Toolbar");
+                c[0].checkbox(&mut look.nav_buttons, "Back, forward, up");
+                c[0].checkbox(&mut look.new_button, "New button");
+                c[0].checkbox(&mut look.path_bar, "Path bar");
+                c[0].checkbox(&mut look.search_bar, "Search box");
+                c[0].checkbox(&mut look.status_bar, "Status bar");
+                c[1].strong("Sidebar");
+                c[1].checkbox(&mut look.sidebar, "Show the sidebar");
+                c[1].add_enabled_ui(look.sidebar, |ui| {
+                    ui.checkbox(&mut look.quick_access, "Quick access");
+                    ui.checkbox(&mut look.drives, "Drives");
+                    ui.add_enabled_ui(look.drives, |ui| {
+                        ui.checkbox(&mut look.network_drives, "Network drives");
+                        ui.checkbox(&mut look.capacity, "Capacity bars");
+                    });
+                    ui.checkbox(&mut look.network, "Network");
+                });
+                c[2].strong("Columns");
+                c[2].checkbox(&mut look.col_date, "Date modified");
+                c[2].checkbox(&mut look.col_type, "Type");
+                c[2].checkbox(&mut look.col_size, "Size");
+                c[2].checkbox(&mut look.col_folder, "Folder (search results)");
+            });
+            ui.add_space(4.0);
+            ui.weak("The ☰ menu stays, so this window is always within reach.");
+        });
+        if font_apply {
+            look.font = self.look_font.trim().to_string();
+        }
+        self.set_look(look);
+        if restart {
+            self.save_look();
+            self.session().save();
+            let at = ctx.input(|i| i.viewport().outer_rect.map(|r| [r.min.x, r.min.y]));
+            if self.open_window(&self.cwd.clone(), at) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        if !open {
+            self.look_open = false;
+            self.save_look();
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         if self.help_open {
             let mut open = true;
@@ -1269,44 +1461,104 @@ impl App {
     }
 }
 
-/// A plain, still look (as on Windows): no animations or shadows, so egui
-/// only redraws on input.
-pub(super) fn install_style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|s| {
-        s.animation_time = 0.0;
-        s.visuals.window_shadow = egui::Shadow::NONE;
-        s.visuals.popup_shadow = egui::Shadow::NONE;
-        s.spacing.scroll = egui::style::ScrollStyle::solid();
-    });
-}
-
 /// Glyphs the interface draws (icons, arrows, menu symbols). The UI font
 /// rarely has them all; fontconfig names a font for each that does.
 const ICON_GLYPHS: &str = "▲▼⏏☰✕↗⬅➡⬆⟳⚠◷🗀🗋🖴🖧🏠🔍🗐";
 
-/// The desktop's UI font, and fallback fonts for the interface's symbols
-/// (as Windows uses Segoe UI Symbol), found through fontconfig and loaded
-/// off the UI thread. egui's own fonts stay last for anything else.
-pub(super) fn load_fonts(ctx: &egui::Context, tx: Sender<Msg>) {
-    let ctx = ctx.clone();
-    std::thread::spawn(move || {
-        let fc = |pattern: &str| -> Option<String> {
-            let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
-            let f = String::from_utf8_lossy(&out.stdout).into_owned();
-            // egui renders TrueType/OpenType outlines; color bitmap emoji fonts can't be drawn.
-            let usable = (f.ends_with(".ttf") || f.ends_with(".otf")) && !f.to_ascii_lowercase().contains("color");
-            usable.then_some(f)
-        };
-        let ui_font = fc("sans-serif");
-        let mut symbol_fonts: Vec<String> = Vec::new();
-        for c in ICON_GLYPHS.chars() {
-            if let Some(f) = fc(&format!("sans-serif:charset={:x}", c as u32))
-                && Some(&f) != ui_font.as_ref()
-                && !symbol_fonts.contains(&f)
-            {
-                symbol_fonts.push(f);
+/// Where font lookups are remembered between runs.
+fn font_cache_path() -> std::path::PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(sys::os(&sys::home())).join(".cache"))
+        .join("fex/fonts")
+}
+
+/// Changes whenever fonts or fontconfig's setup may have: the modification
+/// times of the font and fontconfig folders (fc-cache touches its cache
+/// folders when fonts are installed), and what was asked for.
+fn font_fingerprint(family: &str) -> String {
+    let home = std::path::PathBuf::from(sys::os(&sys::home()));
+    let mut dirs: Vec<std::path::PathBuf> = ["/etc/fonts", "/etc/fonts/conf.d", "/usr/share/fonts", "/usr/local/share/fonts", "/var/cache/fontconfig"].iter().map(Into::into).collect();
+    for d in [".config/fontconfig", ".local/share/fonts", ".fonts", ".cache/fontconfig"] {
+        dirs.push(home.join(d));
+    }
+    let mut out = format!("v1 {} {family}", env!("CARGO_PKG_VERSION"));
+    for d in dirs {
+        let t = std::fs::metadata(&d).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |t| t.as_nanos());
+        out.push_str(&format!(" {t}"));
+    }
+    out
+}
+
+/// The UI font and the symbol fonts for `family`, through fontconfig (one
+/// `fc-match` per symbol, so remembered in `font_cache_path`).
+fn find_fonts(family: &str) -> (Option<String>, Vec<String>) {
+    let cache = font_cache_path();
+    let fingerprint = font_fingerprint(family);
+    if let Ok(text) = std::fs::read_to_string(&cache) {
+        let mut lines = text.lines();
+        if lines.next() == Some(fingerprint.as_str()) {
+            let (mut ui_font, mut symbols, mut ok) = (None, Vec::new(), true);
+            for line in lines {
+                match line.split_once('\t') {
+                    Some(("ui", f)) => ui_font = Some(f.to_string()),
+                    Some(("sym", f)) => symbols.push(f.to_string()),
+                    _ => {}
+                }
+            }
+            for f in ui_font.iter().chain(&symbols) {
+                ok &= std::path::Path::new(f).exists();
+            }
+            if ok {
+                return (ui_font, symbols);
             }
         }
+    }
+    let fc = |pattern: &str| -> Option<String> {
+        let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
+        let f = String::from_utf8_lossy(&out.stdout).into_owned();
+        // egui renders TrueType/OpenType outlines; color bitmap emoji fonts can't be drawn.
+        let usable = (f.ends_with(".ttf") || f.ends_with(".otf")) && !f.to_ascii_lowercase().contains("color");
+        usable.then_some(f)
+    };
+    let ui_font = fc(family);
+    let mut symbols: Vec<String> = Vec::new();
+    for c in ICON_GLYPHS.chars() {
+        if let Some(f) = fc(&format!("sans-serif:charset={:x}", c as u32))
+            && Some(&f) != ui_font.as_ref()
+            && !symbols.contains(&f)
+        {
+            symbols.push(f);
+        }
+    }
+    let mut text = format!("{fingerprint}\n");
+    if let Some(f) = &ui_font {
+        text.push_str(&format!("ui\t{f}\n"));
+    }
+    for f in &symbols {
+        text.push_str(&format!("sym\t{f}\n"));
+    }
+    if let Some(dir) = cache.parent()
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        let tmp = cache.with_extension("tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &cache);
+        }
+    }
+    (ui_font, symbols)
+}
+
+/// The desktop's UI font (or the one chosen in Appearance), and fallback
+/// fonts for the interface's symbols (as Windows uses Segoe UI Symbol),
+/// found through fontconfig and loaded off the UI thread. egui's own fonts
+/// stay last for anything else.
+pub(super) fn load_fonts(ctx: &egui::Context, tx: Sender<Msg>, family: String) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let family = if family.trim().is_empty() { "sans-serif".to_string() } else { family };
+        let (ui_font, symbol_fonts) = find_fonts(&family);
         let mut fonts = egui::FontDefinitions::default();
         let mut names = Vec::new();
         for (i, file) in ui_font.iter().chain(symbol_fonts.iter()).enumerate() {

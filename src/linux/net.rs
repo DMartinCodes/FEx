@@ -7,8 +7,7 @@
 //! standard input, in the order it asks for them; FEx never stores them.
 //! Windows-style `\\server\share` is accepted and means SMB.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use super::session;
 
@@ -51,6 +50,11 @@ pub fn is_share(url: &str) -> bool {
     url.split_once("://").is_some_and(|(_, rest)| rest.trim_matches('/').contains('/'))
 }
 
+/// How long connecting a share may take (servers can be slow to answer,
+/// and SMB tries several dialects), and anything else asked of GVFS.
+const MOUNT_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+const QUERY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn gio() -> Command {
     let mut c = Command::new("gio");
     // Messages are parsed: keep them in English.
@@ -81,20 +85,19 @@ pub fn connect(url: &str, creds: Option<&Credentials>) -> Connected {
     if creds.is_some_and(|c| c.anonymous) {
         cmd.arg("-a");
     }
-    cmd.arg(url).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return Connected::Failed(format!("Could not run gio (install the GLib tools and gvfs-backends): {e}")),
+    cmd.arg(url);
+    // SMB asks for user, domain, password; the others only a password (put
+    // the user in the URL: sftp://user@host). Without credentials stdin is
+    // empty, so a prompt ends at once and is reported as NeedsCredentials.
+    let answers = match creds.filter(|c| !c.anonymous) {
+        Some(c) if url.starts_with("smb://") => format!("{}\n{}\n{}\n", c.user, c.domain, c.password),
+        Some(c) => format!("{}\n", c.password),
+        None => String::new(),
     };
-    if let (Some(mut stdin), Some(c)) = (child.stdin.take(), creds.filter(|c| !c.anonymous)) {
-        // SMB asks for user, domain, password; the others only a password
-        // (put the user in the URL: sftp://user@host).
-        let answers = if url.starts_with("smb://") { format!("{}\n{}\n{}\n", c.user, c.domain, c.password) } else { format!("{}\n", c.password) };
-        let _ = stdin.write_all(answers.as_bytes());
-    }
-    let out = match child.wait_with_output() {
+    let out = match super::sys::output_within(&mut cmd, Some(answers.as_bytes()), MOUNT_LIMIT) {
         Ok(o) => o,
-        Err(e) => return Connected::Failed(e.to_string()),
+        Err(e) if e.starts_with("could not run") => return Connected::Failed(format!("Could not run gio (install the GLib tools and gvfs-backends): {e}")),
+        Err(e) => return Connected::Failed(e),
     };
     if out.status.success() {
         return Connected::Ok;
@@ -113,7 +116,7 @@ pub fn connect(url: &str, creds: Option<&Credentials>) -> Connected {
 
 /// Where GVFS mounted `url` (its local path), once it is connected.
 pub fn local_path(url: &str) -> Option<Vec<u8>> {
-    let out = gio().args(["info", "-a", "standard::name", url]).stdin(Stdio::null()).output().ok()?;
+    let out = super::sys::output_within(gio().args(["info", "-a", "standard::name", url]), None, QUERY_LIMIT).ok()?;
     let text = out.stdout;
     text.split(|&b| b == b'\n').find_map(|l| l.strip_prefix(b"local path: ")).map(|p| p.trim_ascii().to_vec())
 }
@@ -122,18 +125,18 @@ pub fn local_path(url: &str) -> Option<Vec<u8>> {
 /// network mount the user may unmount (`user` in fstab).
 pub fn disconnect(path: &[u8], gvfs: bool) -> Result<(), String> {
     let os = super::sys::os(path);
-    let out = if gvfs { gio().arg("mount").arg("-u").arg(os).output() } else { Command::new("umount").arg(os).env("LC_ALL", "C").output() };
+    let out = if gvfs { super::sys::output_within(gio().arg("mount").arg("-u").arg(os), None, QUERY_LIMIT) } else { super::sys::output_within(Command::new("umount").arg(os).env("LC_ALL", "C"), None, QUERY_LIMIT) };
     match out {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(failure(&o)),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e),
     }
 }
 
 /// The shared folders a server offers (`smb://server`), through GVFS's
 /// network browsing.
 pub fn shares(server: &str) -> Result<Vec<String>, String> {
-    let out = gio().args(["list", &format!("{server}/")]).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    let out = super::sys::output_within(gio().args(["list", &format!("{server}/")]), None, QUERY_LIMIT)?;
     if !out.status.success() {
         return Err(failure(&out));
     }

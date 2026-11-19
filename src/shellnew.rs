@@ -33,6 +33,13 @@ pub struct Item {
     template: Template,
 }
 
+impl Item {
+    /// An empty `.txt` file ("New Text Document.txt"), for Ctrl+Alt+N.
+    pub fn text_document() -> Self {
+        Item { extension: ".txt".into(), label: "Text Document".into(), template: Template::Empty }
+    }
+}
+
 struct Key(HKEY);
 
 impl Key {

@@ -37,6 +37,35 @@ pub struct Meta {
     /// can't be set back by `touch`, so it's the freshness signal.
     pub ctime: i64,
     pub flags: u8,
+    /// `st_mode` (type and permission bits).
+    pub mode: u32,
+}
+
+/// Every user may list this folder: read and search for owner, group and
+/// others alike, and no ACL that could deny someone. (Owner and group bits
+/// matter too: the kernel applies the first class that matches, so an owner
+/// without `r` is refused even when others have it.)
+pub fn world_listable(mode: u32, has_acl: bool) -> bool {
+    mode & libc::S_IFMT == libc::S_IFDIR && mode & 0o555 == 0o555 && !has_acl
+}
+
+/// Whether the open file has a POSIX access ACL. Errors other than "none"
+/// or "not supported" count as having one, so callers fail closed.
+pub fn fd_has_acl(fd: i32) -> bool {
+    let n = unsafe { libc::fgetxattr(fd, c"system.posix_acl_access".as_ptr(), std::ptr::null_mut(), 0) };
+    n > 0 || (n < 0 && !matches!(errno(), libc::ENODATA | libc::EOPNOTSUPP))
+}
+
+/// `fd_has_acl` for a path (a final link is not followed).
+pub fn path_has_acl(path: &[u8]) -> bool {
+    let Ok(c) = cstr(path) else { return true };
+    let n = unsafe { libc::lgetxattr(c.as_ptr(), c"system.posix_acl_access".as_ptr(), std::ptr::null_mut(), 0) };
+    n > 0 || (n < 0 && !matches!(errno(), libc::ENODATA | libc::EOPNOTSUPP))
+}
+
+/// Whether every user may list the folder at `path` (see `world_listable`).
+pub fn path_world_listable(path: &[u8]) -> bool {
+    lstat(path).is_some_and(|m| world_listable(m.mode, false) && !path_has_acl(path))
 }
 
 fn errno() -> i32 {
@@ -83,6 +112,52 @@ impl Dir {
         let c = cstr(path)?;
         let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOCTTY) };
         if fd < 0 { Err(errno()) } else { Ok(Dir { fd }) }
+    }
+
+    /// Open `path` (absolute) only if no component of it is a symbolic link.
+    /// For the root daemon: a folder swapped for a link between listing its
+    /// parent and opening it must not get another folder's names indexed
+    /// under its path. `openat2(RESOLVE_NO_SYMLINKS)` where the kernel has it
+    /// (5.6+); otherwise the opened folder's real path must equal `path`.
+    pub fn open_strict(path: &[u8]) -> Result<Dir, i32> {
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        static NO_OPENAT2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let c = cstr(path)?;
+        let flags = (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NOFOLLOW) as u64;
+        if !NO_OPENAT2.load(std::sync::atomic::Ordering::Relaxed) {
+            let how = OpenHow { flags, mode: 0, resolve: RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS };
+            let fd = unsafe { libc::syscall(libc::SYS_openat2, libc::AT_FDCWD, c.as_ptr(), &how as *const OpenHow, size_of::<OpenHow>()) } as i32;
+            if fd >= 0 {
+                return Ok(Dir { fd });
+            }
+            let e = errno();
+            if e != libc::ENOSYS {
+                return Err(e);
+            }
+            NO_OPENAT2.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let fd = unsafe { libc::open(c.as_ptr(), flags as i32) };
+        if fd < 0 {
+            return Err(errno());
+        }
+        let dir = Dir { fd };
+        let real = std::fs::read_link(format!("/proc/self/fd/{fd}")).map_err(|_| libc::EACCES)?;
+        let want = match path.strip_suffix(b"/") {
+            Some(p) if !p.is_empty() => p,
+            _ => path,
+        };
+        if real.as_os_str().as_bytes() == want { Ok(dir) } else { Err(libc::ELOOP) }
+    }
+
+    pub fn raw_fd(&self) -> i32 {
+        self.fd
     }
 
     /// Call `f` for every entry except `.` and `..`. `buf` is the caller's
@@ -156,6 +231,7 @@ fn statx(dirfd: i32, name: &[u8], follow: i32) -> Option<Meta> {
         mtime: st.stx_mtime.tv_sec * 1_000_000_000 + st.stx_mtime.tv_nsec as i64,
         ctime: st.stx_ctime.tv_sec * 1_000_000_000 + st.stx_ctime.tv_nsec as i64,
         flags: flags_of_mode(st.stx_mode as u32),
+        mode: st.stx_mode as u32,
     })
 }
 
@@ -757,6 +833,51 @@ fn volumes_from(mounts: Vec<Mount>) -> Vec<Mount> {
     out
 }
 
+/// Run `cmd` to completion with `input` on its stdin, collecting its
+/// output, but give up after `limit`: the child is killed and the error
+/// says so. For tools that talk to servers (`gio`), which can wait for a
+/// dead one far longer than anyone would want to watch a spinner.
+pub fn output_within(cmd: &mut std::process::Command, input: Option<&[u8]>, limit: std::time::Duration) -> Result<std::process::Output, String> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let name = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {name}: {e}"))?;
+    if let (Some(mut stdin), Some(data)) = (child.stdin.take(), input) {
+        let _ = stdin.write_all(data);
+    }
+    // Drained on threads, so a chatty child can't fill a pipe and stall.
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{name} gave no answer within {} s (is the server reachable?)", limit.as_secs()));
+            }
+            Err(e) => return Err(format!("{name}: {e}")),
+        }
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+}
+
 /// Open with the desktop's default handler. Returns at once; the child is
 /// reaped on a thread so it never lingers as a zombie.
 pub fn open_with_default(path: &[u8]) -> Result<(), String> {
@@ -829,6 +950,39 @@ mod tests {
         assert_eq!(unescape(br"/media/My\040Disk"), b"/media/My Disk");
         assert_eq!(unescape(br"/plain"), b"/plain");
         assert_eq!(unescape(br"/end\04"), br"/end\04");
+    }
+
+    #[test]
+    fn strict_open_refuses_links_anywhere_in_the_path() {
+        let root = std::env::temp_dir().join(format!("fex-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+        let b = |p: std::path::PathBuf| p.as_os_str().as_bytes().to_vec();
+        assert!(Dir::open_strict(&b(root.join("real/inner"))).is_ok());
+        assert!(Dir::open_strict(&b(root.join("link"))).is_err(), "final link");
+        assert!(Dir::open_strict(&b(root.join("link/inner"))).is_err(), "link in the middle");
+        assert!(Dir::open(&b(root.join("link/inner"))).is_ok(), "the plain open still follows links");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn slow_commands_are_cut_off() {
+        let t = std::time::Instant::now();
+        let r = output_within(std::process::Command::new("sleep").arg("30"), None, std::time::Duration::from_millis(300));
+        assert!(r.is_err() && t.elapsed() < std::time::Duration::from_secs(3));
+        let out = output_within(&mut std::process::Command::new("cat"), Some(b"hello"), std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(out.stdout, b"hello");
+    }
+
+    #[test]
+    fn world_listable_needs_every_class() {
+        assert!(world_listable(libc::S_IFDIR | 0o755, false));
+        assert!(world_listable(libc::S_IFDIR | 0o1777, false));
+        assert!(!world_listable(libc::S_IFDIR | 0o711, false), "execute-only");
+        assert!(!world_listable(libc::S_IFDIR | 0o075, false), "owner without read is refused");
+        assert!(!world_listable(libc::S_IFDIR | 0o755, true), "an ACL may deny someone");
+        assert!(!world_listable(libc::S_IFREG | 0o755, false));
     }
 
     #[test]

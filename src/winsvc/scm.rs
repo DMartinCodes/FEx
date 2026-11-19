@@ -201,6 +201,16 @@ unsafe fn from_wide_ptr(p: *const u16) -> String {
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
 }
 
+/// The process ID of the running index service, if it is running.
+pub fn running_pid() -> Option<u32> {
+    use windows_sys::Win32::System::Services::{QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS};
+    let svc = open(SERVICE_QUERY_STATUS).ok()??;
+    let mut st: SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
+    let mut need = 0u32;
+    let ok = unsafe { QueryServiceStatusEx(svc.0, SC_STATUS_PROCESS_INFO, (&raw mut st).cast(), size_of::<SERVICE_STATUS_PROCESS>() as u32, &mut need) };
+    (ok != 0 && st.dwCurrentState == SERVICE_RUNNING && st.dwProcessId != 0).then_some(st.dwProcessId)
+}
+
 /// The installed service, if any.
 pub fn installed() -> Result<Option<Installed>, String> {
     let Some(svc) = open(SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)? else { return Ok(None) };

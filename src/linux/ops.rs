@@ -495,7 +495,7 @@ fn plan_tree(job: &Job, plan: &mut Plan, src: &[u8], dst: &[u8], mode: u32, merg
         plan.cleanup.push(src.to_vec());
     }
     let src_root = src.strip_suffix(b"/").unwrap_or(src);
-    let (parts, failed) = walk::walk(&[Arc::from(src)], workers, &job.cancel, &HashSet::new(), &|| {}, PlanPart::default, |part: &mut PlanPart, dir, visit| {
+    let (parts, failed) = walk::walk(&[Arc::from(src)], workers, &job.cancel, &HashSet::new(), false, &|| {}, PlanPart::default, |part: &mut PlanPart, dir, visit| {
         let (d, e) = match visit {
             Visit::Begin(_) => return,
             Visit::Unreadable => {

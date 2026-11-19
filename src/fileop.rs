@@ -22,7 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FindExSearchNameMatch, FindFirstFileExW, FlushFileBuffers, GetCompressedFileSizeW, GetDriveTypeW,
     GetFileAttributesExW, GetFileExInfoStandard, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
     MoveFileExW, RemoveDirectoryW, SetFileAttributesW,
-    COPY_FILE_FAIL_IF_EXISTS, COPY_FILE_NO_BUFFERING, FILE_ATTRIBUTE_READONLY, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    COPY_FILE_FAIL_IF_EXISTS, COPY_FILE_NO_BUFFERING, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM, FILE_SHARE_READ, FILE_SHARE_WRITE,
     MOVEFILE_REPLACE_EXISTING, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, SYMBOLIC_LINK_FLAG_DIRECTORY,
     OPEN_EXISTING, PROGRESS_CANCEL, PROGRESS_CONTINUE, WIN32_FILE_ATTRIBUTE_DATA, WIN32_FIND_DATAW,
 };
@@ -211,9 +211,12 @@ pub fn copy_file(
         return Ok(());
     }
     let err = last_error();
-    // A read-only destination blocks overwriting; clear it and retry once.
-    if !fail_if_exists && let Some(st) = stat(dst).filter(|st| st.attrs & FILE_ATTRIBUTE_READONLY != 0) {
-        set_attributes(dst, st.attrs & !FILE_ATTRIBUTE_READONLY)?;
+    // A read-only, hidden or system destination blocks overwriting (CopyFileEx
+    // refuses with "access denied", unlike Explorer); clear those and retry
+    // once. The copy then carries the source's attributes.
+    const BLOCKING: u32 = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    if !fail_if_exists && let Some(st) = stat(dst).filter(|st| st.attrs & BLOCKING != 0) {
+        set_attributes(dst, st.attrs & !BLOCKING)?;
         let retry = check(run(&mut ctx));
         if retry.is_err() {
             let _ = set_attributes(dst, st.attrs);
@@ -525,6 +528,22 @@ mod tests {
 
         assert!(copy_file(&src, &dst, false, true, &AtomicI32::new(0), &mut progress).is_err());
         assert_eq!(fs::read(dst.as_ref()).unwrap(), b"existing");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replace_overwrites_hidden_and_system_destinations() {
+        let dir = scratch("hidden-destination");
+        let src = dir.join("source.ini");
+        fs::write(&src, b"new").unwrap();
+        for (name, attrs) in [("hidden.ini", FILE_ATTRIBUTE_HIDDEN), ("system.ini", FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)] {
+            let dst = dir.join(name);
+            fs::write(&dst, b"old").unwrap();
+            set_attributes(&dst.to_string_lossy(), attrs).unwrap();
+            let mut progress = |_| {};
+            copy_file(&src.to_string_lossy(), &dst.to_string_lossy(), false, false, &AtomicI32::new(0), &mut progress).unwrap();
+            assert_eq!(fs::read(&dst).unwrap(), b"new", "{name}");
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

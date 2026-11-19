@@ -7,6 +7,7 @@
 //! `fex --bench <folder> [query ...]` measures the engine without a window.
 
 mod app;
+mod appearance;
 mod archive;
 mod clip;
 mod daemon;
@@ -174,6 +175,7 @@ fn gui(args: Vec<String>) -> ExitCode {
     }
     let args = window_args(args);
     let session = session::Session::load().unwrap_or_default();
+    let look = appearance::Appearance::load();
     // Without a location, carry on where the last window left off.
     let restore = args.start.is_none();
     let size = args.size.or(session.size).unwrap_or([1100.0, 700.0]);
@@ -182,7 +184,10 @@ fn gui(args: Vec<String>) -> ExitCode {
         .with_app_id("fex")
         .with_inner_size(size)
         .with_min_inner_size([520.0, 320.0])
-        .with_icon(window_icon());
+        .with_icon(window_icon())
+        // Only frosted glass asks for a see-through window: an opaque one is
+        // cheaper for every compositor, and the only kind old ones handle.
+        .with_transparent(look.wants_transparency());
     if let Some(pos) = args.at.or(session.pos.filter(|_| restore)) {
         viewport = viewport.with_position(pos);
     }
@@ -196,7 +201,7 @@ fn gui(args: Vec<String>) -> ExitCode {
         ..Default::default()
     };
     let start = args.start;
-    match eframe::run_native("FEx", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, start, &session, restore))))) {
+    match eframe::run_native("FEx", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, start, &session, restore, look))))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("FEx could not start: {e}\nFEx draws with OpenGL through X11; check that DISPLAY is set and a GL driver (Mesa) is installed.");
@@ -687,7 +692,7 @@ fn bench_interference(args: &[String]) -> ExitCode {
                     let pace: &(dyn Fn() + Sync) = if idle { &pace } else { &|| {} };
                     // Progress counts every entry seen, finished crawl or not.
                     while !stop.load(Relaxed) {
-                        let c = index::Crawl { workers: cores, cancel: stop, skip, with_meta: false, seen: entries, init, pace };
+                        let c = index::Crawl { workers: cores, cancel: stop, skip, with_meta: false, strict: false, seen: entries, init, pace };
                         let _ = index::build(root, &c);
                     }
                 });
