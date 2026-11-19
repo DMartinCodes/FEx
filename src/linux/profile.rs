@@ -164,7 +164,7 @@ fn entry_cost_ns(sample: &[u8], skip: &HashSet<Vec<u8>>) -> u64 {
     });
     let seen = AtomicUsize::new(0);
     let before = process_cpu_ns();
-    let c = Crawl { workers: 1, cancel: &cancel, skip, with_meta: false, seen: &seen, init: &|| {}, pace: &|| {} };
+    let c = Crawl { workers: 1, cancel: &cancel, skip, with_meta: false, strict: false, seen: &seen, init: &|| {}, pace: &|| {} };
     let root: Arc<[u8]> = sample.into();
     let (shards, _) = index::crawl(std::slice::from_ref(&root), &c);
     let cpu = process_cpu_ns().saturating_sub(before);

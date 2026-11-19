@@ -25,13 +25,23 @@ pub struct Fanotify {
     mounts: HashMap<[i32; 2], OwnedFd>,
     pub marked: Vec<Vec<u8>>,
     pub refused: Vec<(Vec<u8>, String)>,
+    /// Folder attribute changes (permissions, owner, ACLs) are reported too,
+    /// on every marked filesystem: permission bits recorded at indexing time
+    /// can be kept current.
+    pub attrib: bool,
 }
 
 pub enum Events {
-    /// Folders whose listings changed.
-    Dirs(Vec<Vec<u8>>),
+    /// Folders whose listings changed, and folders whose attributes changed.
+    Dirs { dirs: Vec<Vec<u8>>, attrib: Vec<Vec<u8>> },
     /// The kernel queue overflowed: only a full sweep is accurate.
     Overflow,
+}
+
+impl Events {
+    fn none() -> Events {
+        Events::Dirs { dirs: Vec::new(), attrib: Vec::new() }
+    }
 }
 
 fn fsid_of(fd: i32) -> Option<[i32; 2]> {
@@ -57,11 +67,17 @@ impl Fanotify {
             return Err(format!("fanotify unavailable: {}", std::io::Error::last_os_error()));
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut me = Fanotify { fd, mounts: HashMap::new(), marked: Vec::new(), refused: Vec::new() };
-        let mask = libc::FAN_CREATE | libc::FAN_DELETE | libc::FAN_MOVED_FROM | libc::FAN_MOVED_TO | libc::FAN_ONDIR;
+        let mut me = Fanotify { fd, mounts: HashMap::new(), marked: Vec::new(), refused: Vec::new(), attrib: true };
+        let base = libc::FAN_CREATE | libc::FAN_DELETE | libc::FAN_MOVED_FROM | libc::FAN_MOVED_TO | libc::FAN_ONDIR;
         for m in mounts {
             let Ok(c) = sys::cstr(m) else { continue };
-            let rc = unsafe { libc::fanotify_mark(me.fd.as_raw_fd(), libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM, mask, libc::AT_FDCWD, c.as_ptr()) };
+            let mark = |mask: u64| unsafe { libc::fanotify_mark(me.fd.as_raw_fd(), libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM, mask, libc::AT_FDCWD, c.as_ptr()) };
+            let mut rc = mark(base | libc::FAN_ATTRIB);
+            if rc != 0 {
+                // Without attribute events, permission bits can't be trusted.
+                me.attrib = false;
+                rc = mark(base);
+            }
             if rc != 0 {
                 me.refused.push((m.clone(), std::io::Error::last_os_error().to_string()));
                 continue;
@@ -82,9 +98,12 @@ impl Fanotify {
     pub fn wait(&self, timeout_ms: i32) -> Events {
         let mut pfd = libc::pollfd { fd: self.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } <= 0 {
-            return Events::Dirs(Vec::new());
+            return Events::none();
         }
         let mut handles: HashSet<([i32; 2], Vec<u8>)> = HashSet::new();
+        // Folders whose attributes changed: (fsid, parent handle, name).
+        let mut attribs: HashSet<([i32; 2], Vec<u8>, Vec<u8>)> = HashSet::new();
+        let listing = libc::FAN_CREATE | libc::FAN_DELETE | libc::FAN_MOVED_FROM | libc::FAN_MOVED_TO;
         let mut buf = vec![0u64; 32 * 1024];
         loop {
             let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len() * 8) };
@@ -124,7 +143,16 @@ impl Fanotify {
                         let hbytes = u32::from_ne_bytes(bytes[r + 12..r + 16].try_into().unwrap()) as usize;
                         if r + 20 + hbytes <= r + rlen {
                             // handle_bytes, handle_type and the handle itself, as the kernel wants them back.
-                            handles.insert((fsid, bytes[r + 12..r + 20 + hbytes].to_vec()));
+                            let handle = bytes[r + 12..r + 20 + hbytes].to_vec();
+                            if mask & libc::FAN_ATTRIB != 0 && mask & libc::FAN_ONDIR != 0 {
+                                let rest = &bytes[r + 20 + hbytes..r + rlen];
+                                let name = if kind == FAN_EVENT_INFO_TYPE_DFID_NAME { &rest[..memchr::memchr(0, rest).unwrap_or(rest.len())] } else { &[][..] };
+                                attribs.insert((fsid, handle.clone(), name.to_vec()));
+                            }
+                            // Attribute changes alone leave listings as they are.
+                            if mask & listing != 0 {
+                                handles.insert((fsid, handle));
+                            }
                         }
                     }
                     r += rlen;
@@ -132,7 +160,21 @@ impl Fanotify {
                 off += len;
             }
         }
-        Events::Dirs(handles.into_iter().filter_map(|(fsid, h)| self.resolve(fsid, &h)).collect())
+        let dirs = handles.into_iter().filter_map(|(fsid, h)| self.resolve(fsid, &h)).collect();
+        // The changed folder is the named child of the reported one (or the
+        // reported folder itself, for a filesystem's root).
+        let mut attrib: Vec<Vec<u8>> = Vec::new();
+        for (fsid, h, name) in attribs {
+            if let Some(dir) = self.resolve(fsid, &h) {
+                if !name.is_empty() && name != b"." {
+                    attrib.push(super::fsys::join(&dir, &name));
+                }
+                attrib.push(dir);
+            }
+        }
+        attrib.sort();
+        attrib.dedup();
+        Events::Dirs { dirs, attrib }
     }
 
     /// Turn a folder handle back into its current path.

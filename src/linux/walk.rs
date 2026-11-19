@@ -83,13 +83,17 @@ pub enum Visit<'a, 'b> {
 /// Walk every folder under `roots` on `workers` threads. Links are not
 /// followed and folders in `skip` (pseudo filesystems) are not entered.
 /// `pace` runs before each folder (background crawls pause there); `init`
-/// runs once on each worker thread (and can set its priority).
+/// runs once on each worker thread (and can set its priority). `strict`
+/// refuses any path with a symbolic link in it (`Dir::open_strict`), for
+/// crawls made with more privileges than the people who search them.
 /// Returns the states of the workers that finished and how many panicked.
+#[allow(clippy::too_many_arguments)]
 pub fn walk<S: Send>(
     roots: &[Arc<[u8]>],
     workers: usize,
     cancel: &AtomicBool,
     skip: &HashSet<Vec<u8>>,
+    strict: bool,
     pace: &(dyn Fn() + Sync),
     init: impl Fn() -> S + Sync,
     visit: impl Fn(&mut S, &Arc<[u8]>, Visit<'_, '_>) + Sync,
@@ -112,7 +116,8 @@ pub fn walk<S: Send>(
                             break;
                         }
                         pace();
-                        let r = Dir::open(&path).and_then(|dir| {
+                        let opened = if strict { Dir::open_strict(&path) } else { Dir::open(&path) };
+                        let r = opened.and_then(|dir| {
                             visit(&mut state, &path, Visit::Begin(&dir));
                             dir.scan(&mut buf, |e| {
                                 let sub = e.flags & (DIR | LINK) == DIR;

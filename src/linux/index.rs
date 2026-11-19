@@ -149,7 +149,18 @@ pub struct Shard {
     dir_ctime: Buf<i64>,
     /// (size, mtime) per entry; empty unless built `with_meta`.
     meta: Vec<(u64, i64)>,
+    /// Per folder, `OWN_PUBLIC` / `CHAIN_PUBLIC` bits (see `Index::chain_public`).
+    /// Kept in memory only (a snapshot doesn't store them; the first sweep
+    /// after loading fills them in); missing entries mean "unknown".
+    dir_perm: Vec<u8>,
 }
+
+/// Folder permission bits recorded at indexing time.
+/// `OWN_PUBLIC`: every user may list this folder (`sys::world_listable`).
+pub const OWN_PUBLIC: u8 = 1;
+/// `CHAIN_PUBLIC`: this folder and every folder above it are `OWN_PUBLIC`,
+/// so anyone can reach and list it: a query needs no permission check.
+pub const CHAIN_PUBLIC: u8 = 2;
 
 impl Shard {
     /// Entries in this shard.
@@ -177,17 +188,44 @@ impl Shard {
     }
 
     /// Start the listing of a folder; entries pushed next belong to it.
-    fn begin_dir(&mut self, path: &[u8], ctime: i64) -> bool {
+    fn begin_dir(&mut self, path: &[u8], ctime: i64, perm: u8) -> bool {
         if self.dir_paths.len() + path.len() > u32::MAX as usize || self.len() >= u32::MAX as usize {
             return false;
         }
         let n = self.len() as u32;
         let at = self.dir_paths.len() as u32;
+        let d = self.ndirs();
         self.dir_starts.vec().push(at);
         self.dir_paths.vec().extend_from_slice(path);
         self.ranges.vec().extend_from_slice(&[n, n]);
         self.dir_ctime.vec().push(ctime);
+        self.set_perm(d, perm);
         true
+    }
+
+    /// Folders of this shard whose parent folder isn't in it.
+    fn crawl_roots(&self) -> Vec<Arc<[u8]>> {
+        let paths: HashSet<&[u8]> = (0..self.ndirs()).map(|d| self.dir_path(d)).collect();
+        (0..self.ndirs())
+            .map(|d| self.dir_path(d))
+            .filter(|p| fsys::parent(p).is_none_or(|q| !paths.contains(&q[..])))
+            .map(Arc::from)
+            .collect()
+    }
+
+    #[inline]
+    fn perm(&self, d: usize) -> u8 {
+        self.dir_perm.get(d).copied().unwrap_or(0)
+    }
+
+    fn set_perm(&mut self, d: usize, perm: u8) {
+        if self.dir_perm.len() <= d {
+            if perm == 0 {
+                return;
+            }
+            self.dir_perm.resize(self.ndirs().max(d + 1), 0);
+        }
+        self.dir_perm[d] = perm;
     }
 
     fn push(&mut self, name: &[u8], flags: u8) -> bool {
@@ -272,6 +310,7 @@ impl Shard {
             + self.ranges.heap_bytes()
             + self.dir_ctime.heap_bytes()
             + self.meta.capacity() * size_of::<(u64, i64)>()
+            + self.dir_perm.capacity()
     }
 
     fn mapped_bytes(&self) -> usize {
@@ -328,8 +367,9 @@ type DirRef = (u32, u32);
 pub type FolderMap = BTreeMap<Box<[u8]>, DirRef>;
 /// (shard, entry): one search match.
 pub type Hit = (u32, u32);
-/// A re-read folder: its ctime and (name, flags) entries.
-type Listing = (i64, Vec<(Box<[u8]>, u8)>);
+/// A re-read folder: its ctime, its `OWN_PUBLIC` bit, and its (name, flags,
+/// ctime) entries (the ctime only for subfolders, else 0).
+type Listing = (i64, u8, Vec<(Box<[u8]>, u8, i64)>);
 
 /// Which folders' entries a query may report. The daemon implements this
 /// per client, so users only see names in folders they could list.
@@ -341,10 +381,15 @@ pub trait Visibility: Sync {
     }
     /// Whether entries of folder `dir` (a global folder id below
     /// `Index::dir_slots`, at `path`) may be reported.
-    fn visible(&self, dir: usize, path: &[u8]) -> bool;
+    fn visible(&self, idx: &Index, dir: usize, path: &[u8]) -> bool;
     /// False when everything is visible, so queries skip the checks.
     fn filters(&self) -> bool {
         true
+    }
+    /// Whether folders marked `CHAIN_PUBLIC` at indexing time may be shown
+    /// without asking `visible` (only while those marks are kept current).
+    fn trusts_public(&self) -> bool {
+        false
     }
 }
 
@@ -352,7 +397,7 @@ pub trait Visibility: Sync {
 pub struct Everything;
 
 impl Visibility for Everything {
-    fn visible(&self, _: usize, _: &[u8]) -> bool {
+    fn visible(&self, _: &Index, _: usize, _: &[u8]) -> bool {
         true
     }
     fn filters(&self) -> bool {
@@ -391,14 +436,123 @@ pub struct DirScan {
     listing: Option<Listing>,
 }
 
+/// Re-read one folder for the daemon: opened without following links (see
+/// `Dir::open_strict`), with its permission bit and its subfolders' ctimes
+/// (so a subfolder replaced by another of the same name is noticed).
 pub fn read_dir(path: Arc<[u8]>) -> DirScan {
-    let listing = Dir::open(&path).ok().and_then(|dir| {
-        let ctime = dir.stat_self()?.ctime;
+    let listing = Dir::open_strict(&path).ok().and_then(|dir| {
+        let me = dir.stat_self()?;
+        let own = if sys::world_listable(me.mode, false) && !sys::fd_has_acl(dir.raw_fd()) { OWN_PUBLIC } else { 0 };
         let mut entries = Vec::new();
-        dir.scan(&mut Vec::new(), |e| entries.push((e.name.into(), e.flags))).ok()?;
-        Some((ctime, entries))
+        dir.scan(&mut Vec::new(), |e| {
+            let ctime = if e.flags & (DIR | LINK) == DIR { dir.stat(e.name).map_or(0, |m| m.ctime) } else { 0 };
+            entries.push((e.name.into(), e.flags, ctime));
+        })
+        .ok()?;
+        Some((me.ctime, own, entries))
     });
     DirScan { path, listing }
+}
+
+/// What a sweep found: folders to re-read, and the `OWN_PUBLIC` bit of
+/// every unchanged folder (as (shard, folder, bit)).
+#[derive(Default)]
+pub struct Swept {
+    pub changed: Vec<Arc<[u8]>>,
+    pub perms: Vec<(u32, u32, u8)>,
+}
+
+/// What applying re-read folders left to do: new subtrees to crawl, and
+/// subfolders whose ctime no longer matches their listing (replaced, or
+/// changed too), to re-read in turn.
+#[derive(Default)]
+pub struct Applied {
+    pub pending: Vec<Arc<[u8]>>,
+    pub recheck: Vec<Arc<[u8]>>,
+}
+
+/// Verify an index in batches, taking the index only for each batch
+/// (`with_index` runs its argument on the index, or returns false when the
+/// index went away or was replaced). Pausing (`pace`) happens between
+/// batches, holding nothing, so a paused sweep never blocks an update or,
+/// behind a waiting update, a query.
+/// Runs its argument on the index, or returns false if it can't (see `sweep_in_batches`).
+pub type WithIndex<'a> = dyn Fn(&mut dyn FnMut(&Index)) -> bool + Sync + 'a;
+
+pub fn sweep_in_batches(
+    with_index: &WithIndex<'_>,
+    workers: usize,
+    cancel: &AtomicBool,
+    init: &(dyn Fn() + Sync),
+    pace: &(dyn Fn() + Sync),
+) -> Option<Swept> {
+    let mut live: Vec<(u32, u32)> = Vec::new();
+    if !with_index(&mut |idx| {
+        live = (0..idx.shards.len())
+            .flat_map(|s| (0..idx.shards[s].ndirs()).filter(move |&d| !idx.dead[s][d]).map(move |d| (s as u32, d as u32)))
+            .collect();
+    }) {
+        return None;
+    }
+    let next = AtomicUsize::new(0);
+    let found = Mutex::new(Swept::default());
+    let lost = AtomicBool::new(false);
+    const BATCH: usize = 256;
+    std::thread::scope(|sc| {
+        for _ in 0..workers.max(1) {
+            sc.spawn(|| {
+                init();
+                let mut mine = Swept::default();
+                loop {
+                    let at = next.fetch_add(BATCH, Relaxed);
+                    if at >= live.len() || cancel.load(Relaxed) || lost.load(Relaxed) {
+                        break;
+                    }
+                    pace();
+                    let ok = with_index(&mut |idx| {
+                        for &(s, d) in &live[at..(at + BATCH).min(live.len())] {
+                            let shard = &idx.shards[s as usize];
+                            let path = shard.dir_path(d as usize);
+                            match sys::lstat(path).filter(|m| m.flags & DIR != 0) {
+                                Some(m) if m.ctime == shard.dir_ctime[d as usize] => {
+                                    let own = sys::world_listable(m.mode, false) && !sys::path_has_acl(path);
+                                    mine.perms.push((s, d, if own { OWN_PUBLIC } else { 0 }));
+                                }
+                                _ => mine.changed.push(Arc::from(path)),
+                            }
+                        }
+                    });
+                    if !ok {
+                        lost.store(true, Relaxed);
+                    }
+                }
+                let mut f = found.lock().unwrap_or_else(PoisonError::into_inner);
+                f.changed.extend(mine.changed);
+                f.perms.extend(mine.perms);
+            });
+        }
+    });
+    if lost.load(Relaxed) {
+        return None;
+    }
+    Some(found.into_inner().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Drop pending folders that lie inside another pending folder: crawling
+/// the outer one covers them (and crawling both would add them twice).
+fn nested_out(mut pending: Vec<Arc<[u8]>>) -> Vec<Arc<[u8]>> {
+    pending.sort();
+    pending.dedup();
+    let mut out: Vec<Arc<[u8]>> = Vec::with_capacity(pending.len());
+    // Sorted, a folder's subfolders follow it (possibly after siblings like
+    // `a b` that sort between `a` and `a/`), so check against every kept root
+    // that could be a prefix: the kept roots form a short chain in practice.
+    for p in pending {
+        if !out.iter().rev().take(64).any(|r| fsys::in_scope(&p, r)) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 fn now_ns() -> u64 {
@@ -536,6 +690,7 @@ impl Index {
             let _guard = if filters { vis.enter() } else { None };
             let (si, a, b) = units[u];
             let shard = &self.shards[si];
+            let trust = filters && vis.trusts_public();
             let mut out = Vec::new();
             let mut last: Option<(u32, bool)> = None;
             shard.scan(m, a, b, |i| {
@@ -544,7 +699,7 @@ impl Index {
                     let ok = match last {
                         Some((ld, ok)) if ld == d => ok,
                         _ => {
-                            let ok = vis.visible(base[si] + d as usize, shard.dir_path(d as usize));
+                            let ok = (trust && shard.perm(d as usize) & CHAIN_PUBLIC != 0) || vis.visible(self, base[si] + d as usize, shard.dir_path(d as usize));
                             last = Some((d, ok));
                             ok
                         }
@@ -600,37 +755,119 @@ impl Index {
     /// folder, on `workers` threads; `init` runs on each (to lower its
     /// priority) and `pace` every few hundred folders (to pause).
     pub fn sweep(&self, workers: usize, cancel: &AtomicBool, init: &(dyn Fn() + Sync), pace: &(dyn Fn() + Sync)) -> Vec<Arc<[u8]>> {
-        let live: Vec<(u32, u32)> = (0..self.shards.len())
-            .flat_map(|s| (0..self.shards[s].ndirs()).filter(move |&d| !self.dead[s][d]).map(move |d| (s as u32, d as u32)))
-            .collect();
-        let next = AtomicUsize::new(0);
-        let found = Mutex::new(Vec::new());
-        const BATCH: usize = 256;
-        std::thread::scope(|sc| {
-            for _ in 0..workers.max(1) {
-                sc.spawn(|| {
-                    init();
-                    let mut mine = Vec::new();
-                    loop {
-                        let at = next.fetch_add(BATCH, Relaxed);
-                        if at >= live.len() || cancel.load(Relaxed) {
-                            break;
-                        }
-                        pace();
-                        for &(s, d) in &live[at..(at + BATCH).min(live.len())] {
-                            let shard = &self.shards[s as usize];
-                            let path = shard.dir_path(d as usize);
-                            let current = sys::lstat(path).filter(|m| m.flags & DIR != 0).map(|m| m.ctime);
-                            if current != Some(shard.dir_ctime[d as usize]) {
-                                mine.push(Arc::from(path));
-                            }
-                        }
-                    }
-                    found.lock().unwrap_or_else(PoisonError::into_inner).extend(mine);
-                });
+        sweep_in_batches(&|f| {
+            f(self);
+            true
+        }, workers, cancel, init, pace)
+        .map_or_else(Vec::new, |s| s.changed)
+    }
+
+    // ------------------------------------------------------------ permissions
+
+    /// Whether everyone can reach and list global folder `dir`, per the bits
+    /// recorded at indexing time (see `CHAIN_PUBLIC`).
+    pub fn chain_public_path(&self, path: &[u8]) -> bool {
+        self.map.as_ref().and_then(|m| m.get(path)).is_some_and(|&(s, d)| self.shards[s as usize].perm(d as usize) & CHAIN_PUBLIC != 0)
+    }
+
+    /// Record the `OWN_PUBLIC` bits a sweep found, then recompute every
+    /// `CHAIN_PUBLIC` bit.
+    pub fn install_perms(&mut self, perms: &[(u32, u32, u8)]) {
+        for &(s, d, own) in perms {
+            if let Some(shard) = self.shards.get_mut(s as usize)
+                && (d as usize) < shard.ndirs()
+            {
+                let p = shard.perm(d as usize);
+                shard.set_perm(d as usize, (p & !OWN_PUBLIC) | (own & OWN_PUBLIC));
             }
-        });
-        found.into_inner().unwrap_or_else(PoisonError::into_inner)
+        }
+        self.recompute_chains(None);
+    }
+
+    /// Forget every `CHAIN_PUBLIC` bit (changes were missed): queries check
+    /// permissions live until the next sweep reinstalls them.
+    pub fn clear_chains(&mut self) {
+        for shard in &mut self.shards {
+            for p in &mut shard.dir_perm {
+                *p &= !CHAIN_PUBLIC;
+            }
+        }
+    }
+
+    /// The `OWN_PUBLIC` bit of the folder at `path` changed (a chmod, chown
+    /// or ACL change reported live): record it and recompute the chain bits
+    /// of its subtree. False if the folder isn't indexed.
+    pub fn update_own(&mut self, path: &[u8], own: u8) -> bool {
+        let Some(&(s, d)) = self.map().get(path) else { return false };
+        let shard = &mut self.shards[s as usize];
+        let p = shard.perm(d as usize);
+        if p & OWN_PUBLIC != own & OWN_PUBLIC {
+            shard.set_perm(d as usize, (p & !OWN_PUBLIC) | (own & OWN_PUBLIC));
+            self.recompute_chains(Some(path));
+        }
+        true
+    }
+
+    /// Whether every folder above the index root is world-listable.
+    fn above_root_public(&self) -> bool {
+        let mut p = fsys::parent(&self.root);
+        while let Some(dir) = p {
+            if !sys::path_world_listable(&dir) {
+                return false;
+            }
+            p = fsys::parent(&dir);
+        }
+        true
+    }
+
+    /// Recompute `CHAIN_PUBLIC` for the subtree at `root` (everything if
+    /// `None`). Parents sort before their children in the folder map, so one
+    /// pass in key order sees each parent's bit before its children need it.
+    fn recompute_chains(&mut self, root: Option<&[u8]>) {
+        let top = self.above_root_public();
+        let index_root: Vec<u8> = fsys::trim_end_slashes(&self.root).to_vec();
+        let map = self.map();
+        let keys: Vec<(DirRef, Option<DirRef>, bool)> = {
+            let entries: Box<dyn Iterator<Item = (&Box<[u8]>, &DirRef)>> = match root {
+                None => Box::new(map.iter()),
+                Some(r) => {
+                    let (trimmed, exact) = match r.strip_suffix(b"/") {
+                        Some(t) => (t, None),
+                        None => (r, map.get_key_value(r)),
+                    };
+                    let lo = [trimmed, b"/"].concat();
+                    let hi = [trimmed, b"0"].concat();
+                    Box::new(exact.into_iter().chain(map.range::<[u8], _>((Bound::Included(&lo[..]), Bound::Excluded(&hi[..])))))
+                }
+            };
+            entries
+                .map(|(k, &v)| {
+                    let is_root = fsys::trim_end_slashes(k) == index_root.as_slice();
+                    let parent = if is_root { None } else { fsys::parent(k).and_then(|p| map.get(&p[..]).copied()) };
+                    (v, parent, is_root)
+                })
+                .collect()
+        };
+        for ((s, d), parent, is_root) in keys {
+            let up = if is_root { top } else { parent.is_some_and(|(ps, pd)| self.shards[ps as usize].perm(pd as usize) & CHAIN_PUBLIC != 0) };
+            let shard = &mut self.shards[s as usize];
+            let p = shard.perm(d as usize);
+            let chain = up && p & OWN_PUBLIC != 0;
+            shard.set_perm(d as usize, if chain { p | CHAIN_PUBLIC } else { p & !CHAIN_PUBLIC });
+        }
+    }
+
+    /// Permission bits of the live folders in the order `save` writes them,
+    /// so a reloaded snapshot can take them over (`adopt_perms`).
+    pub fn live_perms(&self) -> Vec<u8> {
+        (0..self.shards.len()).flat_map(|s| (0..self.shards[s].ndirs()).filter(move |&d| !self.dead[s][d]).map(move |d| self.shards[s].perm(d))).collect()
+    }
+
+    /// Take over `live_perms` of the index this snapshot was saved from.
+    pub fn adopt_perms(&mut self, perms: Vec<u8>) {
+        if self.shards.len() == 1 && perms.len() == self.shards[0].ndirs() {
+            self.shards[0].dir_perm = perms;
+        }
     }
 
     /// The folder map, computed from a shared reference: build it under a
@@ -698,38 +935,68 @@ impl Index {
 
     /// Replace the listings of re-read folders. Folders that vanished take
     /// their subtrees with them; subfolders that are new are returned, to be
-    /// crawled (`crawl`) and added (`add_shards`).
-    pub fn apply(&mut self, scans: Vec<DirScan>, skip: &HashSet<Vec<u8>>) -> Vec<Arc<[u8]>> {
+    /// crawled (`crawl`) and added (`add_shards`), and subfolders whose ctime
+    /// no longer matches their listing, to be re-read and applied in turn.
+    pub fn apply(&mut self, mut scans: Vec<DirScan>, skip: &HashSet<Vec<u8>>) -> Applied {
+        // Deepest first: a subfolder re-read in the same batch is current by
+        // the time its parent compares its ctime.
+        scans.sort_by_key(|s| std::cmp::Reverse(s.path.len()));
         let mut pending = Vec::new();
+        let mut recheck = Vec::new();
         let mut doomed: HashSet<Vec<u8>> = HashSet::new();
+        // Folders whose chain bits must be recomputed with their subtrees.
+        let mut rechain: Vec<Arc<[u8]>> = Vec::new();
         for scan in scans {
             let old = self.map().get(&*scan.path).copied();
-            let old_subdirs: HashSet<Box<[u8]>> = match old {
+            let (old_subdirs, old_perm): (HashSet<Box<[u8]>>, Option<u8>) = match old {
                 Some((s, d)) => {
                     let shard = &self.shards[s as usize];
                     let (a, b) = shard.range(d as usize);
                     let subs = (a..b).filter(|&i| shard.entry_flags[i] & (DIR | LINK) == DIR).map(|i| shard.name(i).into()).collect();
+                    let perm = shard.perm(d as usize);
                     self.kill(s, d);
                     self.map().remove(&*scan.path);
-                    subs
+                    (subs, Some(perm))
                 }
-                None => HashSet::new(),
+                None => (HashSet::new(), None),
             };
-            let Some((ctime, entries)) = scan.listing else {
+            let Some((ctime, own, entries)) = scan.listing else {
                 doomed.insert(scan.path.to_vec());
                 continue;
             };
+            // An unchanged OWN bit keeps the chain bit (the parent's, if it
+            // changed, is recomputed with its whole subtree below).
+            let perm = match old_perm {
+                Some(p) if p & OWN_PUBLIC == own & OWN_PUBLIC => own | (p & CHAIN_PUBLIC),
+                _ => {
+                    rechain.push(scan.path.clone());
+                    own
+                }
+            };
             let mut o = self.overlay_shard();
-            if !self.shards[o].begin_dir(&scan.path, ctime) {
+            if !self.shards[o].begin_dir(&scan.path, ctime, perm) {
                 self.overlay = None;
                 o = self.overlay_shard();
-                self.shards[o].begin_dir(&scan.path, ctime);
+                if !self.shards[o].begin_dir(&scan.path, ctime, perm) {
+                    // Can't happen for a fresh shard; leave the folder out rather than corrupt the map.
+                    doomed.insert(scan.path.to_vec());
+                    continue;
+                }
             }
-            let mut new_subdirs = HashSet::new();
-            for (name, flags) in &entries {
+            let mut new_subdirs: HashSet<Box<[u8]>> = HashSet::new();
+            for (name, flags, sub_ctime) in &entries {
                 self.shards[o].push(name, *flags);
                 if flags & (DIR | LINK) == DIR {
                     new_subdirs.insert(name.clone());
+                    // Same name as before: is it still the folder we listed?
+                    if old_subdirs.contains(name) {
+                        let full = fsys::join(&scan.path, name);
+                        if let Some(&(cs, cd)) = self.map().get(&*full)
+                            && self.shards[cs as usize].dir_ctime[cd as usize] != *sub_ctime
+                        {
+                            recheck.push(Arc::from(full));
+                        }
+                    }
                 }
             }
             let d = self.shards[o].ndirs() - 1;
@@ -756,24 +1023,41 @@ impl Index {
                 self.map().remove(&k);
             }
         }
+        for root in &rechain {
+            self.recompute_chains(Some(root));
+        }
         self.generation += 1;
-        pending
+        recheck.retain(|p| !doomed.iter().any(|d| fsys::in_scope(p, d)));
+        Applied { pending: nested_out(pending), recheck }
     }
 
     /// Add freshly crawled subtrees (from `apply`'s pending folders).
     pub fn add_shards(&mut self, shards: Vec<Shard>, errors: usize) {
+        let mut roots: Vec<Arc<[u8]>> = Vec::new();
+        // The map must describe the index before these shards join it.
+        self.map();
         for shard in shards {
-            let s = self.shards.len() as u32;
-            for d in 0..shard.ndirs() {
-                let path: Box<[u8]> = shard.dir_path(d).into();
-                if let Some((os, od)) = self.map().insert(path, (s, d as u32)) {
-                    self.kill(os, od);
-                }
-            }
+            // Push first: a folder crawled twice (a new folder and its new
+            // subfolder both pending) can appear twice in one shard, and the
+            // older copy must be killable by the time the newer one replaces it.
+            let s = self.shards.len();
             self.entries += shard.len();
             self.dirs += shard.ndirs();
             self.dead.push(vec![false; shard.ndirs()]);
             self.shards.push(shard);
+            for d in 0..self.shards[s].ndirs() {
+                let path: Box<[u8]> = self.shards[s].dir_path(d).into();
+                if let Some((os, od)) = self.map().insert(path, (s as u32, d as u32))
+                    && (os as usize, od as usize) != (s, d)
+                {
+                    self.kill(os, od);
+                }
+            }
+            roots.extend(self.shards[s].crawl_roots());
+        }
+        // Chain bits for the new subtrees (each crawl root with what's under it).
+        for root in nested_out(roots) {
+            self.recompute_chains(Some(&root));
         }
         self.errors += errors;
         self.generation += 1;
@@ -867,6 +1151,7 @@ impl Index {
             ranges: l.buf(8)?,
             dir_ctime: l.buf(9)?,
             meta: Vec::new(),
+            dir_perm: Vec::new(),
         };
         shard.validate()?;
         if shard.len() as u64 != l.info.entries || shard.ndirs() as u64 != l.info.dirs {
@@ -904,6 +1189,9 @@ pub struct Crawl<'a> {
     pub cancel: &'a AtomicBool,
     pub skip: &'a HashSet<Vec<u8>>,
     pub with_meta: bool,
+    /// The daemon's crawl: never follow a link anywhere in a path, and
+    /// record each folder's permission bit.
+    pub strict: bool,
     /// Entries seen so far, for progress display.
     pub seen: &'a AtomicUsize,
     /// Runs once on each crawler thread (to lower its priority).
@@ -925,6 +1213,7 @@ pub fn crawl(roots: &[Arc<[u8]>], c: &Crawl) -> (Vec<Shard>, usize) {
         c.workers.max(1),
         c.cancel,
         c.skip,
+        c.strict,
         c.pace,
         || {
             (c.init)();
@@ -933,8 +1222,10 @@ pub fn crawl(roots: &[Arc<[u8]>], c: &Crawl) -> (Vec<Shard>, usize) {
         |w, path, visit| match visit {
             Visit::Unreadable => w.errors += 1,
             Visit::Begin(dir) => {
-                let ctime = dir.stat_self().map_or(0, |m| m.ctime);
-                if !w.shard.begin_dir(path, ctime) {
+                let me = dir.stat_self();
+                let ctime = me.map_or(0, |m| m.ctime);
+                let own = c.strict && me.is_some_and(|m| sys::world_listable(m.mode, false)) && !sys::fd_has_acl(dir.raw_fd());
+                if !w.shard.begin_dir(path, ctime, if own { OWN_PUBLIC } else { 0 }) {
                     w.errors += 1;
                 }
             }
@@ -999,6 +1290,7 @@ impl Build {
                 cancel: &self.cancel,
                 skip: &skip,
                 with_meta: self.with_meta,
+                strict: false,
                 seen: &self.seen,
                 init: &|| {},
                 pace: &|| {},
@@ -1128,11 +1420,117 @@ mod tests {
         let skip = HashSet::new();
         let changed = index.sweep(2, &cancel, &|| {}, &|| {});
         let n = changed.len();
-        let pending = index.apply(changed.into_iter().map(read_dir).collect(), &skip);
-        let seen = AtomicUsize::new(0);
-        let (shards, errors) = crawl(&pending, &Crawl { workers: 2, cancel: &cancel, skip: &skip, with_meta: false, seen: &seen, init: &|| {}, pace: &|| {} });
-        index.add_shards(shards, errors);
+        let mut changed: Vec<Arc<[u8]>> = changed;
+        while !changed.is_empty() {
+            let applied = index.apply(changed.into_iter().map(read_dir).collect(), &skip);
+            let seen = AtomicUsize::new(0);
+            let (shards, errors) = crawl(&applied.pending, &Crawl { workers: 2, cancel: &cancel, skip: &skip, with_meta: false, strict: true, seen: &seen, init: &|| {}, pace: &|| {} });
+            index.add_shards(shards, errors);
+            changed = applied.recheck;
+        }
         n
+    }
+
+    /// The daemon's maintenance thread died on this: a new folder and its
+    /// new subfolder both pending made the subfolder appear twice in one
+    /// crawl shard, and replacing the first copy indexed a shard not yet added.
+    #[test]
+    fn a_folder_crawled_twice_in_one_shard_is_added_once() {
+        let (root, r) = scratch("twice");
+        let mut index = Build::new(&r, false).run().unwrap();
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::write(root.join("a/b/c/deep.txt"), b"").unwrap();
+        let (a, ab) = (fsys::join(&r, b"a"), fsys::join(&r, b"a/b"));
+        let cancel = AtomicBool::new(false);
+        let skip = HashSet::new();
+        let seen = AtomicUsize::new(0);
+        // One worker: both copies of a/b land in the same shard.
+        let c = Crawl { workers: 1, cancel: &cancel, skip: &skip, with_meta: false, strict: true, seen: &seen, init: &|| {}, pace: &|| {} };
+        let (shards, errors) = crawl(&[Arc::from(a.clone()), Arc::from(ab)], &c);
+        index.add_shards(shards, errors);
+        let truth = Build::new(&r, false).run().unwrap();
+        // (The root wasn't re-read, so only its own entry `a` is missing.)
+        assert_eq!(all(&index, &a), all(&truth, &a));
+        assert_eq!((index.entries + 1, index.dirs), (truth.entries, truth.dirs));
+        // Pending lists never hold a folder inside another one.
+        let nested = nested_out(vec![Arc::from(fsys::join(&r, b"a/b")), Arc::from(a.clone()), Arc::from(fsys::join(&r, b"a b")), Arc::from(a)]);
+        assert_eq!(nested.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A folder replaced by another of the same name (renamed away, a new
+    /// one made in its place) must not keep the old one's listing.
+    #[test]
+    fn a_replaced_subfolder_is_reread() {
+        let (root, r) = scratch("replaced");
+        fs::create_dir_all(root.join("x")).unwrap();
+        fs::write(root.join("x/secret.txt"), b"").unwrap();
+        let mut index = Build::new(&r, false).run().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::rename(root.join("x"), root.join("y")).unwrap();
+        fs::create_dir(root.join("x")).unwrap();
+        fs::write(root.join("x/public.txt"), b"").unwrap();
+        // Only the parent is reported (as fanotify would).
+        let applied = index.apply(vec![read_dir(Arc::from(r.clone()))], &HashSet::new());
+        assert_eq!(applied.recheck.iter().map(|p| p.to_vec()).collect::<Vec<_>>(), vec![fsys::join(&r, b"x")]);
+        let again = index.apply(applied.recheck.into_iter().map(read_dir).collect(), &HashSet::new());
+        let seen = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let skip = HashSet::new();
+        let c = Crawl { workers: 2, cancel: &cancel, skip: &skip, with_meta: false, strict: true, seen: &seen, init: &|| {}, pace: &|| {} };
+        let (shards, errors) = crawl(&[applied.pending, again.pending].concat(), &c);
+        index.add_shards(shards, errors);
+        let m = Matcher::new("secret", false).unwrap().unwrap();
+        let (rows, _) = index.query(&m, &r, 10, &|| false).unwrap();
+        assert_eq!(rows.iter().map(|row| row.full_path(b"")).collect::<Vec<_>>(), vec![fsys::join(&r, b"y/secret.txt")]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Permission bits recorded while indexing: a folder counts as public
+    /// only if it and every folder above it can be listed by everyone.
+    #[test]
+    fn chain_bits_follow_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, r) = scratch("chain");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(root.join("pub/deeper")).unwrap();
+        fs::create_dir_all(root.join("priv/inner")).unwrap();
+        fs::create_dir_all(root.join("xonly/shared")).unwrap();
+        for d in ["pub", "pub/deeper", "priv/inner", "xonly/shared"] {
+            fs::set_permissions(root.join(d), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::set_permissions(root.join("priv"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(root.join("xonly"), fs::Permissions::from_mode(0o711)).unwrap();
+        let seen = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let skip = HashSet::new();
+        let c = Crawl { workers: 2, cancel: &cancel, skip: &skip, with_meta: false, strict: true, seen: &seen, init: &|| {}, pace: &|| {} };
+        let mut index = build(&r, &c).unwrap();
+        index.install_perms(&[]);
+        let public = |idx: &Index, p: &str| idx.chain_public_path(&fsys::join(&r, p.as_bytes()));
+        // Only meaningful where every folder above the scratch dir is public.
+        if index.above_root_public() {
+            assert!(public(&index, "pub") && public(&index, "pub/deeper"));
+        }
+        assert!(!public(&index, "priv") && !public(&index, "priv/inner"));
+        assert!(!public(&index, "xonly") && !public(&index, "xonly/shared"));
+        // A chmod reported live updates the subtree.
+        fs::set_permissions(root.join("pub"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(index.update_own(&fsys::join(&r, b"pub"), 0));
+        assert!(!public(&index, "pub/deeper"));
+        // Saving and reloading keeps them (the snapshot itself doesn't).
+        let snap = root.with_extension("snap");
+        let perms = index.live_perms();
+        index.save(&snap).unwrap();
+        let mut reloaded = Index::load(&snap).unwrap();
+        reloaded.adopt_perms(perms);
+        let map = reloaded.build_map();
+        reloaded.install_map(map);
+        assert!(!public(&reloaded, "priv/inner"));
+        fs::set_permissions(root.join("priv"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.join("xonly"), fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(snap);
     }
 
     #[test]
