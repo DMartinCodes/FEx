@@ -25,7 +25,7 @@ use super::props::{self, Props};
 use super::session::Session;
 use super::sys;
 use super::watch::{self, Change, Watcher};
-use super::{archive, clip, fileop, net, proto, recent, templates, trash, xdnd};
+use super::{archive, clip, drives, fileop, net, proto, recent, templates, trash, xdnd};
 use crate::typeahead;
 
 #[path = "app_ui.rs"]
@@ -144,6 +144,24 @@ fn list_volumes(with_gvfs: bool) -> Vec<Volume> {
     out
 }
 
+/// What the sidebar's Drives section shows besides mounted volumes.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct DriveExtras {
+    /// Removable filesystems plugged in but not mounted.
+    unmounted: Vec<drives::Unmounted>,
+    /// Removable volumes another mount hides.
+    covered: Vec<drives::Covered>,
+}
+
+/// Mounted volumes, plus the removable drives they don't show. Runs on the
+/// volume watcher's thread (see `list_volumes`).
+fn scan_drives() -> (Vec<Volume>, DriveExtras) {
+    let extras = DriveExtras { unmounted: drives::unmounted(), covered: drives::covered(&sys::mounts()) };
+    // A covered volume's folder shows the mount on top, not the drive.
+    let volumes = list_volumes(true).into_iter().filter(|v| !extras.covered.iter().any(|c| c.point == v.point && c.source == v.source)).collect();
+    (volumes, extras)
+}
+
 /// A mount as the sidebar shows it: local volumes by folder name and type,
 /// network shares by folder name and server.
 fn volume_of_mount(m: sys::Mount) -> Volume {
@@ -165,6 +183,9 @@ fn volume_of_mount(m: sys::Mount) -> Volume {
 
 /// Free space of one volume, and when it was read.
 struct Space {
+    /// The device it was read from; another drive later mounted at the same
+    /// point (one stick swapped for another) makes it stale.
+    source: Vec<u8>,
     capacity: Option<(u64, u64)>,
     checked: Instant,
 }
@@ -186,11 +207,17 @@ enum Msg {
     /// (not covered, still building, refused), so search in-process; else it
     /// didn't answer twice running, so report it rather than start a crawl.
     DaemonFailed { generation: u64, definitive: bool },
-    /// The sidebar's volumes changed (a mount came or went).
-    Volumes(Vec<Volume>),
-    /// Free and total bytes of a volume (`None`: couldn't be read).
-    Space { point: Vec<u8>, capacity: Option<(u64, u64)> },
+    /// The sidebar's volumes changed (a mount came or went, a removable
+    /// drive was plugged in or out).
+    Volumes(Vec<Volume>, DriveExtras),
+    /// Free and total bytes of a volume (`None`: couldn't be read), and the
+    /// device it was read from.
+    Space { point: Vec<u8>, source: Vec<u8>, capacity: Option<(u64, u64)> },
     DriveEjected(String),
+    /// A removable drive was mounted (where), or couldn't be.
+    DriveMounted { device: Vec<u8>, name: String, open: bool, result: Result<Vec<u8>, String> },
+    /// A drive with nothing mounted was powered off.
+    DrivePoweredOff { disk: Vec<u8>, name: String, result: Result<(), String> },
     Templates(Vec<templates::Item>),
     RecentChanged,
     Navigate(Vec<u8>),
@@ -339,6 +366,10 @@ enum Action {
     ExtractSelected,
     CreateLink(usize),
     EjectDrive(Vec<u8>),
+    /// Mount a removable drive (by device), and open it if `open`.
+    MountDrive { device: Vec<u8>, open: bool },
+    /// Power off the drive (`/dev/sdb`) holding an unmounted filesystem.
+    PowerOffDrive(Vec<u8>),
     RunAs(usize),
     OpenLocation(usize),
     CopyPath(usize),
@@ -491,6 +522,10 @@ pub struct App {
 
     places: Vec<(String, Vec<u8>)>,
     volumes: Vec<Volume>,
+    /// Removable drives that aren't mounted, or are hidden by another mount.
+    drive_extras: DriveExtras,
+    /// Devices with a mount or power-off in flight.
+    drives_busy: HashSet<Vec<u8>>,
     space: HashMap<Vec<u8>, Space>,
     /// Volumes with a free-space query in flight (one that hangs on a dead
     /// server stays here, so it is never asked again in parallel).
@@ -596,6 +631,8 @@ impl App {
             // Mounts now (reading mountinfo is instant); GVFS shares and
             // ejectability arrive from the volume watcher.
             volumes: list_volumes(false),
+            drive_extras: DriveExtras::default(),
+            drives_busy: HashSet::new(),
             space: HashMap::new(),
             space_pending: HashSet::new(),
             report_network_space: session.network_space,
@@ -659,19 +696,20 @@ impl App {
     }
 
     /// Re-list volumes when the mount table changes (USB sticks, network
-    /// shares, `mount`), and every few seconds for GVFS shares, which don't
-    /// change it. Only differences reach the UI.
+    /// shares, `mount`), when a block device is plugged in or out, and every
+    /// few seconds for GVFS shares, which don't change it. Only differences
+    /// reach the UI.
     fn watch_volumes(&self) {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        let mut last = self.volumes.clone();
+        let mut last = (self.volumes.clone(), self.drive_extras.clone());
         thread::Builder::new()
             .name("volumes".into())
             .spawn(move || {
                 let mut check = move || {
-                    let now = catch_unwind(|| list_volumes(true)).unwrap_or_else(|_| last.clone());
+                    let now = catch_unwind(scan_drives).unwrap_or_else(|_| last.clone());
                     if now != last {
                         last = now.clone();
-                        if tx.send(Msg::Volumes(now)).is_err() {
+                        if tx.send(Msg::Volumes(now.0, now.1)).is_err() {
                             return false;
                         }
                         ctx.request_repaint();
@@ -691,10 +729,11 @@ impl App {
             return;
         }
         self.space_pending.insert(point.to_vec());
+        let source = self.volumes.iter().find(|v| v.point == point).map(|v| v.source.clone()).unwrap_or_default();
         let (point, tx, ctx) = (point.to_vec(), self.tx.clone(), self.ctx.clone());
         thread::spawn(move || {
             let capacity = sys::space(&point);
-            let _ = tx.send(Msg::Space { point, capacity });
+            let _ = tx.send(Msg::Space { point, source, capacity });
             ctx.request_repaint();
         });
     }
@@ -1417,6 +1456,68 @@ impl App {
         });
     }
 
+    /// Mount a removable drive that is plugged in but not mounted (no
+    /// automounter, or unmounted earlier), through udisks.
+    fn mount_drive(&mut self, device: Vec<u8>, open: bool) {
+        let Some(d) = self.drive_extras.unmounted.iter().find(|u| u.device == device) else { return };
+        if !self.drives_busy.insert(device.clone()) {
+            return;
+        }
+        let name = d.name();
+        self.error = None;
+        self.notice = Some(format!("Mounting {name}…"));
+        let (dev, failed_dev, failed_name) = (device.clone(), device, name.clone());
+        self.spawn_io_or(
+            move || Some(Msg::DriveMounted { result: drives::mount(&dev), device: dev, name, open }),
+            move |e| Msg::DriveMounted { device: failed_dev, name: failed_name, open: false, result: Err(e) },
+        );
+    }
+
+    fn drive_mounted(&mut self, device: Vec<u8>, name: String, open: bool, result: Result<Vec<u8>, String>) {
+        self.drives_busy.remove(&device);
+        match result {
+            Ok(point) => {
+                // The volume watcher lists it as soon as the mount table
+                // changes; show it now so the sidebar never lags the folder.
+                self.drive_extras.unmounted.retain(|u| u.device != device);
+                if !self.volumes.iter().any(|v| v.point == point) {
+                    let m = sys::Mount { point: point.clone(), fstype: String::new(), source: device };
+                    let mut v = volume_of_mount(m);
+                    v.label = format!("🖴 {}", lossy(fsys::base_name(&point)));
+                    self.volumes.push(v);
+                }
+                self.notice = Some(format!("{name} is mounted at {}", lossy(&point)));
+                if open {
+                    self.navigate(point, true);
+                }
+            }
+            Err(e) => {
+                self.notice = None;
+                self.error = Some(format!("Could not mount {name}: {e}"));
+            }
+        }
+    }
+
+    /// Power down a removable drive none of whose filesystems is mounted.
+    fn power_off_drive(&mut self, disk: Vec<u8>) {
+        let Some(d) = self.drive_extras.unmounted.iter().find(|u| u.disk == disk) else { return };
+        if self.volumes.iter().any(|v| v.ejectable && sys::real_path(&v.source).is_some_and(|s| s.starts_with(&disk))) {
+            self.error = Some(format!("Eject the mounted parts of {} first", lossy(&disk)));
+            return;
+        }
+        if !self.drives_busy.insert(disk.clone()) {
+            return;
+        }
+        let name = d.name();
+        self.error = None;
+        self.notice = Some(format!("Powering off {name}…"));
+        let (dev, failed_dev, failed_name) = (disk.clone(), disk, name.clone());
+        self.spawn_io_or(
+            move || Some(Msg::DrivePoweredOff { result: drives::power_off(&dev), disk: dev, name }),
+            move |e| Msg::DrivePoweredOff { disk: failed_dev, name: failed_name, result: Err(e) },
+        );
+    }
+
     fn open_properties(&mut self) {
         if archive::is_location(&self.cwd) || self.cwd == NETWORK {
             return;
@@ -1806,15 +1907,28 @@ impl App {
                         self.search_error = Some("The index daemon didn't answer; search again in a moment.".into());
                     }
                 }
-                Msg::Volumes(volumes) => {
-                    self.space.retain(|p, _| volumes.iter().any(|v| v.point == *p));
+                Msg::Volumes(volumes, extras) => {
+                    // Free space read from a drive no longer at that point is stale.
+                    self.space.retain(|p, s| volumes.iter().any(|v| v.point == *p && v.source == s.source));
                     self.volumes = volumes;
+                    self.drive_extras = extras;
                 }
-                Msg::Space { point, capacity } => {
+                Msg::Space { point, source, capacity } => {
                     self.space_pending.remove(&point);
-                    self.space.insert(point, Space { capacity, checked: Instant::now() });
+                    // Dropped if another drive was mounted there meanwhile.
+                    if self.volumes.iter().any(|v| v.point == point && v.source == source) {
+                        self.space.insert(point, Space { source, capacity, checked: Instant::now() });
+                    }
                 }
                 Msg::DriveEjected(name) => self.notice = Some(format!("You can now safely remove {name}")),
+                Msg::DriveMounted { device, name, open, result } => self.drive_mounted(device, name, open, result),
+                Msg::DrivePoweredOff { disk, name, result } => {
+                    self.drives_busy.remove(&disk);
+                    match result {
+                        Ok(()) => self.notice = Some(format!("You can now safely remove {name}")),
+                        Err(e) => self.error = Some(format!("Could not power off {name}: {e}")),
+                    }
+                }
                 Msg::Templates(items) => {
                     self.templates_loading = false;
                     self.templates = Some(items);
@@ -2243,6 +2357,8 @@ impl App {
                 }
             }
             Action::EjectDrive(path) => self.eject(path),
+            Action::MountDrive { device, open } => self.mount_drive(device, open),
+            Action::PowerOffDrive(disk) => self.power_off_drive(disk),
             Action::RunAs(i) => {
                 self.select_only(i);
                 self.run_as(i);
@@ -2352,7 +2468,7 @@ impl App {
         }
         if let (false, Some(dest)) = (dropped.is_empty(), dest) {
             let paths: Vec<Vec<u8>> = dropped.into_iter().map(|p| p.into_os_string().into_vec()).collect();
-            let same = fileop::same_volume(&paths[0], &dest);
+            let same = fileop::same_volume_quick(&paths[0], &dest);
             self.start_job(Self::drop_kind(mods, same), paths, dest);
         }
     }

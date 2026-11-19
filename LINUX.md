@@ -44,6 +44,7 @@ platform parts are Linux-native:
 | ShellNew templates | `~/Templates` (XDG) plus an empty document |
 | Mapped drives, Network page | GVFS through `gio` (`linux/net.rs`): connect `smb://`, `sftp://`, `ftp://`, `dav://` shares (and `\\server\share`), FEx's own credentials dialog, browse a server's shares, disconnect |
 | Safely eject | udisks (`udisksctl unmount`, then power-off, or detach for disk images), polkit asks if needed; `gio mount -e` as fallback |
+| Removable drives without a usable letter (`volumes.rs`) | `linux/drives.rs`: removable filesystems plugged in but not mounted (no automounter, or unmounted earlier) are listed under Drives, found from sysfs and the udev database without opening the device; click to mount and open (udisks, `gio mount -d` as fallback), or power the drive off. EFI, recovery, swap, MS-reserved and udev-ignored partitions are left out. A removable volume another mount hides is flagged instead of listed. Plug-ins show up at once (inotify on `/run/udev/data`), else within 5 s |
 | Run as administrator | Run as root through `pkexec` (executables only) |
 | Recent, session, tabs, windows | Same; files under `~/.config/fex` and `~/.local/share/fex` |
 
@@ -63,7 +64,7 @@ Sans Symbols 2), as Windows uses Segoe UI Symbol.
 
 Runtime tools used when present: `xdg-open` (opening files), `gio`
 (network shares; `libglib2.0-bin` and `gvfs-backends`), `udisksctl`
-(ejecting), `pkexec` (run as root), `fc-match` (fonts).
+(mounting and ejecting), `pkexec` (run as root), `fc-match` (fonts).
 
 Not on Linux: dragging a tab into *another* FEx window (tearing off works);
 virtual files dropped from other programs (only real files arrive through

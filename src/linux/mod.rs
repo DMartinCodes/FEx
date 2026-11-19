@@ -10,6 +10,7 @@ mod app;
 mod archive;
 mod clip;
 mod daemon;
+mod drives;
 mod fanotify;
 mod fileop;
 mod fsys;

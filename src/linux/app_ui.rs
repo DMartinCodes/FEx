@@ -315,6 +315,54 @@ impl App {
                     }
                 });
             }
+            // Removable drives plugged in but not mounted: no automounter, or unmounted earlier.
+            for d in &self.drive_extras.unmounted {
+                let name = d.name();
+                let busy = self.drives_busy.contains(&d.device) || self.drives_busy.contains(&d.disk);
+                ui.horizontal(|ui| {
+                    let tip = format!(
+                        "{} · {} · {}\nPlugged in but not mounted. Click to mount and open it.",
+                        lossy(&d.device),
+                        d.fstype,
+                        fsys::format_size(d.size)
+                    );
+                    let response = ui.add_enabled(!busy, egui::Button::selectable(false, format!("🖴 {name}  (not mounted)"))).on_hover_text(tip);
+                    if response.clicked() {
+                        action = Some(Action::MountDrive { device: d.device.clone(), open: true });
+                    }
+                    response.context_menu(|ui| {
+                        if ui.button("Mount and open").clicked() {
+                            action = Some(Action::MountDrive { device: d.device.clone(), open: true });
+                            ui.close();
+                        }
+                        if ui.button("Mount").clicked() {
+                            action = Some(Action::MountDrive { device: d.device.clone(), open: false });
+                            ui.close();
+                        }
+                        if ui.button("Power off").on_hover_text(format!("Power off {} so it can be unplugged", lossy(&d.disk))).clicked() {
+                            action = Some(Action::PowerOffDrive(d.disk.clone()));
+                            ui.close();
+                        }
+                    });
+                    if busy {
+                        ui.spinner();
+                    } else if ui.small_button("⏏").on_hover_text(format!("Power off {name} so it can be unplugged")).clicked() {
+                        action = Some(Action::PowerOffDrive(d.disk.clone()));
+                    }
+                });
+            }
+            // Removable volumes something else was mounted over: their files can't be reached.
+            for c in &self.drive_extras.covered {
+                let tip = format!(
+                    "{} is mounted at {}, but {} was mounted at {} on top of it, so its files can't be reached. Unmount that to reach this drive.",
+                    lossy(&c.source),
+                    lossy(&c.point),
+                    lossy(&c.by),
+                    lossy(&c.by_point)
+                );
+                ui.add_enabled(false, egui::Button::selectable(false, format!("⚠ {}  (hidden)", lossy(fsys::base_name(&c.point)))))
+                    .on_disabled_hover_text(tip);
+            }
             ui.add_space(8.0);
             entry(ui, "🖧 Network".into(), NETWORK, "Connect to shares, browse servers", &self.cwd);
             for s in &self.servers {
@@ -1059,7 +1107,7 @@ impl App {
             _ if from_archive => false,
             (Some(t), Some((cached, same))) if cached == t => *same,
             (Some(t), _) => {
-                let same = fileop::same_volume(&drag.paths[0], t);
+                let same = fileop::same_volume_quick(&drag.paths[0], t);
                 drag.same_volume = Some((t.clone(), same));
                 same
             }
