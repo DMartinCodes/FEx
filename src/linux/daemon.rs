@@ -1251,18 +1251,28 @@ mod tests {
     /// switch is skipped; the checks themselves are the kernel's.)
     #[test]
     fn matches_under_an_unlistable_folder_stay_hidden() {
-        let root = std::env::temp_dir().join(format!("fex-vis-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("open/sub")).unwrap();
-        fs::create_dir_all(root.join("closed/pub")).unwrap();
-        fs::write(root.join("open/sub/match-a.txt"), b"").unwrap();
-        fs::write(root.join("closed/pub/match-b.txt"), b"").unwrap();
-        let r = root.as_os_str().as_bytes().to_vec();
+        let root_dir = std::env::temp_dir().join(format!("fex-vis-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root_dir);
+        fs::create_dir_all(root_dir.join("open/sub")).unwrap();
+        fs::create_dir_all(root_dir.join("closed/pub")).unwrap();
+        fs::write(root_dir.join("open/sub/match-a.txt"), b"").unwrap();
+        fs::write(root_dir.join("closed/pub/match-b.txt"), b"").unwrap();
+        let r = root_dir.as_os_str().as_bytes().to_vec();
         let idx = index::Build::new(&r, false).run().unwrap();
         // Search permission only: reachable by a known path, not listable.
-        fs::set_permissions(root.join("closed"), fs::Permissions::from_mode(0o311)).unwrap();
-        let me = unsafe { libc::geteuid() };
-        let creds = Creds { pid: 0, uid: me, gid: unsafe { libc::getegid() }, groups: Vec::new() };
+        fs::set_permissions(root_dir.join("closed"), fs::Permissions::from_mode(0o311)).unwrap();
+        // Root bypasses permission checks, so as root (e.g. CI in a
+        // container) check as an unprivileged client through the daemon's
+        // real per-thread impersonation instead.
+        let root = unsafe { libc::geteuid() } == 0;
+        for d in [&root_dir, &root_dir.join("open"), &root_dir.join("open/sub")] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let creds = if root {
+            Creds { pid: 0, uid: 65534, gid: 65534, groups: Vec::new() }
+        } else {
+            Creds { pid: 0, uid: unsafe { libc::geteuid() }, gid: unsafe { libc::getegid() }, groups: Vec::new() }
+        };
         let vis = UserVisibility { creds: &creds, scope: &r, trusted: false, cache: std::iter::repeat_with(|| AtomicU8::new(0)).take(idx.dir_slots()).collect(), above: Mutex::new(HashMap::new()) };
         struct AsMe<'a>(&'a UserVisibility<'a>);
         impl Visibility for AsMe<'_> {
@@ -1275,11 +1285,11 @@ mod tests {
             }
         }
         let m = Matcher::new("match", false).unwrap().unwrap();
-        let hits = idx.query_hits(&m, &r, &|| false, &AsMe(&vis)).unwrap();
+        let hits = if root { idx.query_hits(&m, &r, &|| false, &vis) } else { idx.query_hits(&m, &r, &|| false, &AsMe(&vis)) }.unwrap();
         let names: Vec<Vec<u8>> = idx.hit_rows(&hits).iter().map(|row| row.name.to_vec()).collect();
-        fs::set_permissions(root.join("closed"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root_dir.join("closed"), fs::Permissions::from_mode(0o755)).unwrap();
         ACTING_AS.with(|a| a.set(None));
         assert_eq!(names, vec![b"match-a.txt".to_vec()]);
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root_dir);
     }
 }
