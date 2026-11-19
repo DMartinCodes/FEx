@@ -241,6 +241,19 @@ pub fn same_volume(a: &[u8], dest: &[u8]) -> bool {
     }
 }
 
+/// `same_volume` for the UI thread, which must never stat on a network
+/// mount (a dead server stalls the call, a hard NFS mount indefinitely).
+/// Paths on network mounts are compared by the mount table alone.
+pub fn same_volume_quick(a: &[u8], dest: &[u8]) -> bool {
+    let mounts = sys::mounts();
+    let on = |p: &[u8]| mounts.iter().filter(|m| super::fsys::in_scope(p, &m.point)).max_by_key(|m| m.point.len());
+    let remote = |m: &sys::Mount| sys::is_network_fs(&m.fstype) || m.fstype.starts_with("fuse.gvfs");
+    match (on(a), on(dest)) {
+        (Some(x), Some(y)) if remote(x) || remote(y) => x.point == y.point && x.source == y.source,
+        _ => same_volume(a, dest),
+    }
+}
+
 /// The mount holding `path` (longest matching mount point of its real path).
 pub fn mount_of(path: &[u8]) -> Option<sys::Mount> {
     let real = sys::real_path(path).or_else(|| super::fsys::parent(path).and_then(|p| sys::real_path(&p)))?;
@@ -272,16 +285,72 @@ pub fn ejectable(m: &sys::Mount) -> bool {
         return false;
     }
     let Some(real) = sys::real_path(&m.source) else { return false };
-    let name = String::from_utf8_lossy(super::fsys::base_name(&real)).into_owned();
-    let Ok(dev) = std::fs::canonicalize(format!("/sys/class/block/{name}")) else { return false };
+    removable_block(&String::from_utf8_lossy(super::fsys::base_name(&real)))
+}
+
+/// The sysfs folder of block device `name` (`sdb1`) and of the disk holding
+/// it (`sdb`; the device itself when it is a whole disk).
+pub fn block_and_disk(name: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    let dev = std::fs::canonicalize(format!("/sys/class/block/{name}")).ok()?;
     // A partition's attributes live on its disk, one level up.
     let disk = if dev.join("partition").exists() { dev.parent().map(|p| p.to_path_buf()).unwrap_or(dev.clone()) } else { dev.clone() };
+    Some((dev, disk))
+}
+
+/// Whether block device `name` (`sdb1`, `sr0`, `loop3`) is on a drive that
+/// can be safely removed (see `ejectable`).
+pub fn removable_block(name: &str) -> bool {
+    let Some((_, disk)) = block_and_disk(name) else { return false };
     let flag = |f: &str| std::fs::read_to_string(disk.join(f)).is_ok_and(|v| v.trim() == "1");
     let path = disk.to_string_lossy();
     // A disk image attached through the desktop (udisks sets autoclear) is
     // ejected like a stick: unmounted, then detached.
     let image = name.starts_with("loop") && flag("loop/autoclear");
     flag("removable") || path.contains("/usb") || path.contains("/mmc") || path.contains("/firewire") || name.starts_with("sr") || image
+}
+
+/// Run a desktop tool (`udisksctl`, `gio`) with no terminal, killing it if
+/// it takes longer than `limit` (they can wait on questions nobody can
+/// answer). The error is the tool's last message, or why it couldn't run
+/// (prefixed with `cmd:`, so callers can tell a missing tool apart).
+pub fn run_tool(cmd: &str, args: &[&std::ffi::OsStr], limit: std::time::Duration) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(cmd)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd}: {e}"))?;
+    // Drained as it comes, so a chatty tool can't fill the pipe and stall.
+    let reader = child.stderr.take().map(|mut e| {
+        std::thread::spawn(move || {
+            let mut err = String::new();
+            let _ = std::io::Read::read_to_string(&mut e, &mut err);
+            err
+        })
+    });
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let err = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+                let err = err.trim().rsplit(": ").next().unwrap_or("").trim_end_matches('.').to_string();
+                return if status.success() { Ok(()) } else { Err(if err.is_empty() { format!("{cmd} failed") } else { err }) };
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{cmd} did not finish"));
+            }
+        }
+    }
 }
 
 /// Unmount a removable volume and power its drive down (or detach a disk
@@ -291,37 +360,8 @@ pub fn ejectable(m: &sys::Mount) -> bool {
 /// isn't installed), bounded by a timeout since it can wait on questions
 /// nobody can answer.
 pub fn eject(point: &[u8], source: &[u8]) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    let run = |cmd: &str, args: &[&std::ffi::OsStr], limit: Duration| -> Result<(), String> {
-        let mut child = Command::new(cmd)
-            .args(args)
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("{cmd}: {e}"))?;
-        let deadline = Instant::now() + limit;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let mut err = String::new();
-                    if let Some(mut e) = child.stderr.take() {
-                        let _ = std::io::Read::read_to_string(&mut e, &mut err);
-                    }
-                    let err = err.trim().rsplit(": ").next().unwrap_or("").trim_end_matches('.').to_string();
-                    return if status.success() { Ok(()) } else { Err(if err.is_empty() { format!("{cmd} failed") } else { err }) };
-                }
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("{cmd} did not finish"));
-                }
-            }
-        }
-    };
+    use std::time::Duration;
+    let run = run_tool;
     let dev = sys::os(source);
     let udisks = run("udisksctl", &["unmount".as_ref(), "-b".as_ref(), dev], Duration::from_secs(60));
     match udisks {

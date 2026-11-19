@@ -456,29 +456,83 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Call `changed` whenever the mount table changes (the kernel flags
-/// /proc/self/mountinfo with POLLPRI), and at least every `every`, until
-/// it returns false. Blocks the calling thread.
+/// /proc/self/mountinfo with POLLPRI), when a block device comes or goes
+/// (udev writes or removes its entry under /run/udev/data), and at least
+/// every `every`, until it returns false. Blocks the calling thread.
 pub fn watch_mounts(every: std::time::Duration, mut changed: impl FnMut() -> bool) {
     let fd = unsafe { libc::open(c"/proc/self/mountinfo".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    // Best effort: without udev (containers) plugged-in drives show up on the timer.
+    let mut devices = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if devices >= 0 {
+        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_TO | libc::IN_MOVED_FROM | libc::IN_CLOSE_WRITE;
+        if unsafe { libc::inotify_add_watch(devices, c"/run/udev/data".as_ptr(), mask) } < 0 {
+            unsafe { libc::close(devices) };
+            devices = -1;
+        }
+    }
+    let drain = |fd: i32| {
+        let mut buf = [0u8; 4096];
+        while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    };
+    let mut last = std::time::Instant::now();
     loop {
-        if fd >= 0 {
-            let mut p = libc::pollfd { fd, events: libc::POLLPRI | libc::POLLERR, revents: 0 };
-            let rc = unsafe { libc::poll(&mut p, 1, every.as_millis() as i32) };
-            if rc > 0 {
+        let mut fds = [
+            libc::pollfd { fd, events: libc::POLLPRI | libc::POLLERR, revents: 0 },
+            libc::pollfd { fd: devices, events: libc::POLLIN, revents: 0 },
+        ];
+        if fd >= 0 || devices >= 0 {
+            // A negative fd is ignored by poll.
+            let wait = every.saturating_sub(last.elapsed()).as_millis() as i32;
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, wait) };
+            if rc > 0 && fds[0].revents != 0 {
                 // Re-arm: the event stays raised until the file is read again.
-                let mut buf = [0u8; 4096];
                 unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-                while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+                drain(fd);
+            }
+            if rc > 0 && fds[1].revents != 0 && block_device_event(devices) {
+                // A device brings a burst of udev entries (disk, then each
+                // partition); let it settle so one re-list sees them all.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                drain(devices);
+            } else if rc > 0 && fds[0].revents == 0 && last.elapsed() < every {
+                continue; // only other kinds of devices changed
             }
         } else {
             std::thread::sleep(every);
         }
+        last = std::time::Instant::now();
         if !changed() {
             break;
         }
     }
-    if fd >= 0 {
-        unsafe { libc::close(fd) };
+    for f in [fd, devices] {
+        if f >= 0 {
+            unsafe { libc::close(f) };
+        }
+    }
+}
+
+/// Read pending events from an inotify watch on /run/udev/data; true if
+/// any was about a block device (entries named `b<major>:<minor>`).
+fn block_device_event(fd: i32) -> bool {
+    let mut buf = [0u64; 512];
+    let mut found = false;
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len() * 8) };
+        if n <= 0 {
+            return found;
+        }
+        // SAFETY: `n` bytes were written by the kernel.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, n as usize) };
+        let mut off = 0;
+        // struct inotify_event { i32 wd; u32 mask; u32 cookie; u32 len; char name[len]; }
+        while off + 16 <= bytes.len() {
+            let mask = u32::from_ne_bytes([bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]]);
+            let len = u32::from_ne_bytes([bytes[off + 12], bytes[off + 13], bytes[off + 14], bytes[off + 15]]) as usize;
+            let name = bytes.get(off + 16..off + 16 + len).unwrap_or_default();
+            found |= mask & libc::IN_Q_OVERFLOW != 0 || name.first() == Some(&b'b');
+            off += 16 + len;
+        }
     }
 }
 
