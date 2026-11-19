@@ -32,31 +32,41 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, ERROR_PIPE_CONNECTED, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, IsWellKnownSid, RevertToSelf, TokenUser, WinLocalSystemSid, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_IMPERSONATE, TOKEN_QUERY,
-    TOKEN_USER,
+    GetSecurityDescriptorDacl, GetTokenInformation, IsWellKnownSid, RevertToSelf, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL,
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateDirectoryW, CreateFileW, FlushFileBuffers, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL, WRITE_DAC,
 };
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, ImpersonateNamedPipeClient, PeekNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapCompact};
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, OpenThreadToken, SetProcessWorkingSetSize, SetThreadToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, GetProcessTimes, OpenProcess, OpenThreadToken, SetProcessWorkingSetSize, SetThreadToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, THREAD_TERMINATE,
+};
 
 use super::access::{self, Descriptors, Sd};
 use super::profile::{self, Profile};
@@ -83,6 +93,11 @@ const MAX_CLIENTS: usize = 32;
 const CHUNK_ROWS: usize = 16 * 1024;
 const MAX_FIRST: usize = 1000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// A reply write (or the final flush) that makes no progress for this long
+/// is cancelled: a client that stops reading can't hold a slot forever.
+const WRITE_STALL: Duration = Duration::from_secs(30);
+/// A drive whose watcher keeps failing is re-crawled at most this often.
+const RECRAWL_MIN: Duration = Duration::from_secs(600);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -157,19 +172,144 @@ impl Drop for Sddl {
 
 /// The state folder holds every name on the machine: SYSTEM and
 /// Administrators only (protected from inheriting anything looser).
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    if dir.exists() {
-        return Ok(());
+const PRIVATE_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// `%ProgramData%\FEx` (the log, and the state folder): users may read,
+/// only SYSTEM and Administrators may create anything in it.
+const PUBLIC_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)";
+
+/// A handle closed on drop.
+struct Owned(HANDLE);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
     }
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
+}
+
+// SAFETY: a kernel handle may be used from any thread.
+unsafe impl Send for Owned {}
+
+/// Open `path` itself, never what a reparse point in its place names.
+fn open_no_follow(path: &Path, access: u32) -> Option<Owned> {
+    let w = wide(&path.to_string_lossy());
+    let h = unsafe {
+        CreateFileW(
+            w.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    (h != INVALID_HANDLE_VALUE).then_some(Owned(h))
+}
+
+/// Not a reparse point, of the expected kind, and owned by SYSTEM or the
+/// Administrators group (so no standard user made it or can change its ACL).
+fn trusted(h: &Owned, dir: bool) -> bool {
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(h.0, &mut info) } == 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != dir
+    {
+        return false;
     }
-    let sddl = Sddl::new("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)").ok_or_else(std::io::Error::last_os_error)?;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let rc = unsafe { GetSecurityInfo(h.0, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &mut owner, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut sd) };
+    if rc != 0 {
+        return false;
+    }
+    let ok = !owner.is_null() && unsafe { IsWellKnownSid(owner, WinLocalSystemSid) != 0 || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 };
+    unsafe { LocalFree(sd) };
+    ok
+}
+
+/// Make `dir` a folder SYSTEM or Administrators own, with exactly the DACL
+/// `sddl`. One that someone else made (ProgramData lets standard users
+/// create folders), or a reparse point, is moved aside unread and replaced.
+/// `drop_links`: also remove reparse points directly inside it (older
+/// versions left `%ProgramData%\FEx` open to users).
+fn secure_dir(dir: &Path, sddl: &str, drop_links: bool, notes: &mut Vec<String>) -> std::io::Result<()> {
+    let sd = Sddl::new(sddl).ok_or_else(std::io::Error::last_os_error)?;
+    if std::fs::symlink_metadata(dir).is_ok() {
+        match open_no_follow(dir, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES) {
+            Some(h) if trusted(&h, true) => {
+                if drop_links {
+                    remove_links_in(dir, notes);
+                }
+                let (mut present, mut defaulted) = (0, 0);
+                let mut dacl: *mut ACL = std::ptr::null_mut();
+                if unsafe { GetSecurityDescriptorDacl(sd.sa.lpSecurityDescriptor, &mut present, &mut dacl, &mut defaulted) } == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let rc = unsafe {
+                    SetSecurityInfo(h.0, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), dacl, std::ptr::null())
+                };
+                if rc != 0 {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+                return Ok(());
+            }
+            h => {
+                drop(h);
+                let name = dir.file_name().map_or_else(|| "FEx".into(), |n| n.to_string_lossy().into_owned());
+                let aside = dir.with_file_name(format!("{name}.untrusted-{}", now_ns()));
+                // Renaming moves a reparse point itself, never what it names.
+                std::fs::rename(dir, &aside)?;
+                notes.push(format!("{} wasn't created by the service (or is a link); moved aside to {}", dir.display(), aside.display()));
+            }
+        }
+    }
     let path: Vec<u16> = wide(&dir.to_string_lossy());
-    if unsafe { CreateDirectoryW(path.as_ptr(), &sddl.sa) } == 0 {
+    if unsafe { CreateDirectoryW(path.as_ptr(), &sd.sa) } == 0 {
+        // Including a folder someone recreated in the meantime: fail closed.
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Remove reparse points (links, junctions) directly in `dir`, without
+/// following them.
+fn remove_links_in(dir: &Path, notes: &mut Vec<String>) {
+    use std::os::windows::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        let Ok(m) = std::fs::symlink_metadata(&path) else { continue };
+        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            continue;
+        }
+        let removed = if m.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 { std::fs::remove_dir(&path) } else { std::fs::remove_file(&path) };
+        notes.push(format!("removed link {}: {}", path.display(), removed.map_or_else(|e| e.to_string(), |()| "ok".into())));
+    }
+}
+
+/// Delete `file` if it's a link or wasn't written by SYSTEM or Administrators.
+fn drop_untrusted_file(file: &Path, notes: &mut Vec<String>) {
+    if std::fs::symlink_metadata(file).is_err() {
+        return;
+    }
+    let ok = open_no_follow(file, READ_CONTROL | FILE_READ_ATTRIBUTES).is_some_and(|h| trusted(&h, false));
+    if !ok {
+        let removed = std::fs::remove_file(file);
+        notes.push(format!("removed {} (not written by the service): {}", file.display(), removed.map_or_else(|e| e.to_string(), |()| "ok".into())));
+    }
+}
+
+/// Secure `%ProgramData%\FEx`, the log in it, and the private state folder,
+/// before the service writes anything there.
+fn prepare_dirs(state_dir: &Path, log_file: &Path, notes: &mut Vec<String>) -> std::io::Result<()> {
+    let public = state_dir.parent().ok_or_else(|| std::io::Error::other("the state folder has no parent"))?;
+    if let Some(data) = public.parent() {
+        std::fs::create_dir_all(data)?;
+    }
+    secure_dir(public, PUBLIC_SDDL, true, notes)?;
+    drop_untrusted_file(log_file, notes);
+    drop_untrusted_file(&log_file.with_extension("log.old"), notes);
+    secure_dir(state_dir, PRIVATE_SDDL, false, notes)
 }
 
 struct Drive {
@@ -185,6 +325,8 @@ struct Drive {
     /// position stay, so the next start can resume the catch-up.
     caught_up: AtomicBool,
     last_save: Mutex<Instant>,
+    /// When the last crawl finished (successfully or not).
+    last_crawl: Mutex<Option<Instant>>,
 }
 
 struct Shared {
@@ -194,7 +336,9 @@ struct Shared {
     /// Folder security descriptors, shared by all queries.
     sds: Descriptors,
     /// Per client process, the number of its latest query: older ones stop.
-    clients: Mutex<HashMap<u32, Arc<AtomicU64>>>,
+    /// Keyed by (process ID, process start time): IDs are reused, and a new
+    /// process numbers its queries from the start again.
+    clients: Mutex<HashMap<(u32, u64), Arc<AtomicU64>>>,
     throttle: Arc<Throttle>,
     activity: Mutex<&'static str>,
     verified_ns: AtomicU64,
@@ -210,14 +354,17 @@ impl Shared {
 /// Run the service until `request_stop`. `ready` runs once the pipe is up.
 pub fn run(cfg: Config, ready: impl FnOnce()) {
     let log_file = log_path(&cfg.state_dir);
-    if let Some(dir) = log_file.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    // Nothing is written (not even the log) until the folders are known to
+    // be the service's own.
+    let mut notes = Vec::new();
+    if let Err(e) = prepare_dirs(&cfg.state_dir, &log_file, &mut notes) {
+        eprintln!("fex-service: cannot secure {}: {e}", cfg.state_dir.display());
+        return;
     }
     let _ = LOG_FILE.set(log_file);
     log(&format!("starting FEx {}", env!("CARGO_PKG_VERSION")));
-    if let Err(e) = create_private_dir(&cfg.state_dir) {
-        log(&format!("cannot create {}: {e}", cfg.state_dir.display()));
-        return;
+    for n in notes {
+        log(&n);
     }
     let profile_path = cfg.state_dir.join("profile");
     let profile = match Profile::load(&profile_path) {
@@ -234,7 +381,7 @@ pub fn run(cfg: Config, ready: impl FnOnce()) {
         drives: cfg
             .roots
             .iter()
-            .map(|r| Drive { root: r.clone(), tracked: AtomicBool::new(false), caught_up: AtomicBool::new(false), live: RwLock::new(None), stale: Arc::new(AtomicBool::new(false)), last_save: Mutex::new(Instant::now()) })
+            .map(|r| Drive { root: r.clone(), tracked: AtomicBool::new(false), caught_up: AtomicBool::new(false), live: RwLock::new(None), stale: Arc::new(AtomicBool::new(false)), last_save: Mutex::new(Instant::now()), last_crawl: Mutex::new(None) })
             .collect(),
         throttle: Throttle::start(cfg.reserve.unwrap_or(profile.reserve), profile.cores, cfg.memory_floor),
         sds: Descriptors::default(),
@@ -306,7 +453,9 @@ fn crawl(sh: &Arc<Shared>, d: &Drive) -> Option<usize> {
     if STOP.load(Relaxed) {
         return None;
     }
-    let idx = build.run(&|_, _| {})?;
+    let idx = build.run(&|_, _| {});
+    *d.last_crawl.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    let idx = idx?;
     let entries = idx.entries;
     log(&format!("crawled {}: {entries} entries in {:.1} s ({} unreadable)", d.root, t.elapsed().as_secs_f64(), idx.errors));
     d.stale.store(false, Relaxed);
@@ -470,7 +619,14 @@ fn maintain(sh: &Arc<Shared>, save_every: Duration, user_reserve: bool) {
                 break;
             }
             if d.stale.load(Relaxed) {
-                log(&format!("{}: the watcher lost changes; crawling again", d.root));
+                // A watcher that keeps failing (a drive that can't be watched)
+                // mustn't turn into back-to-back crawls. Until the next one the
+                // drive stays stale, so it isn't saved as if current.
+                let recent = d.last_crawl.lock().unwrap_or_else(PoisonError::into_inner).is_some_and(|t| t.elapsed() < RECRAWL_MIN);
+                if recent {
+                    continue;
+                }
+                log(&format!("{}: the watcher lost changes or stopped; crawling again", d.root));
                 sh.set_activity("crawling");
                 crawl(sh, d);
                 sh.verified_ns.store(now_ns(), Relaxed);
@@ -601,7 +757,7 @@ fn follow_permissions(sh: &Arc<Shared>) {
     for (d, t) in sh.drives.iter().zip(&tails) {
         d.tracked.store(t.is_some(), Relaxed);
         if t.is_none() {
-            log(&format!("{}: no change journal; permissions are checked folder by folder", d.root));
+            log(&format!("{}: no NTFS change journal; permissions are checked folder by folder", d.root));
         }
     }
     while !STOP.load(Relaxed) {
@@ -651,8 +807,12 @@ fn follow_permissions(sh: &Arc<Shared>) {
 // ------------------------------------------------------------ pipe
 
 fn serve_pipe(sh: &Arc<Shared>, ready: impl FnOnce()) {
-    // SYSTEM and Administrators: full control; authenticated users: read and write.
-    let Some(sddl) = Sddl::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)") else {
+    // SYSTEM and Administrators: full control. Authenticated users: read,
+    // write data and attributes, but not FILE_CREATE_PIPE_INSTANCE (0x4, which
+    // GENERIC_WRITE would include): otherwise any user could add instances
+    // of their own and answer, or impersonate, other users' clients.
+    // 0x12019b = FILE_GENERIC_READ | FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES.
+    let Some(sddl) = Sddl::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;AU)") else {
         log("cannot build the pipe's security descriptor");
         return;
     };
@@ -703,10 +863,7 @@ fn serve_pipe(sh: &Arc<Shared>, ready: impl FnOnce()) {
         let (sh, counter) = (sh.clone(), active.clone());
         let spawned = thread::Builder::new().name("fex-client".into()).spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&sh, &pipe)));
-            unsafe {
-                FlushFileBuffers(pipe.as_raw_handle());
-                DisconnectNamedPipe(pipe.as_raw_handle());
-            }
+            unsafe { DisconnectNamedPipe(pipe.as_raw_handle()) };
             counter.fetch_sub(1, Relaxed);
         });
         if spawned.is_err() {
@@ -874,10 +1031,125 @@ impl Visibility for TokenVisibility<'_> {
     }
 }
 
+/// Watches one client thread's pipe writes and cancels one that makes no
+/// progress for `WRITE_STALL` (`CancelSynchronousIo`), so a client that
+/// stops reading can't keep its thread and slot.
+struct WriteGuard {
+    state: Arc<(Mutex<GuardState>, Condvar)>,
+    watcher: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct GuardState {
+    /// When the write in progress started.
+    since: Option<Instant>,
+    done: bool,
+}
+
+impl WriteGuard {
+    fn start() -> Option<WriteGuard> {
+        let mut me: HANDLE = std::ptr::null_mut();
+        let ok = unsafe { DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mut me, THREAD_TERMINATE, 0, 0) };
+        if ok == 0 {
+            return None;
+        }
+        let me = Owned(me);
+        let state: Arc<(Mutex<GuardState>, Condvar)> = Arc::default();
+        let st = state.clone();
+        let watcher = thread::Builder::new()
+            .name("fex-client-writes".into())
+            .spawn(move || {
+                let me = me; // the whole handle (and its Drop), not just the field
+                let (lock, cv) = &*st;
+                let mut g = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                while !g.done {
+                    g = cv.wait_timeout(g, Duration::from_secs(1)).unwrap_or_else(PoisonError::into_inner).0;
+                    if g.since.is_some_and(|t| t.elapsed() >= WRITE_STALL) {
+                        g.since = None;
+                        unsafe { CancelSynchronousIo(me.0) };
+                    }
+                }
+            })
+            .ok()?;
+        Some(WriteGuard { state, watcher: Some(watcher) })
+    }
+
+    fn writing(&self, on: bool) {
+        self.state.0.lock().unwrap_or_else(PoisonError::into_inner).since = on.then(Instant::now);
+    }
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        self.state.0.lock().unwrap_or_else(PoisonError::into_inner).done = true;
+        self.state.1.notify_all();
+        if let Some(w) = self.watcher.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+/// The reply side of a client's pipe, with each write (and the final flush)
+/// under the client thread's `WriteGuard`.
+struct Replies<'a> {
+    pipe: &'a File,
+    guard: Option<&'a WriteGuard>,
+}
+
+impl Replies<'_> {
+    fn guarded<T>(&self, f: impl FnOnce() -> T) -> T {
+        if let Some(g) = self.guard {
+            g.writing(true);
+        }
+        let r = f();
+        if let Some(g) = self.guard {
+            g.writing(false);
+        }
+        r
+    }
+}
+
+impl Write for Replies<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let pipe = self.pipe;
+        self.guarded(|| (&*pipe).write(buf))
+    }
+
+    /// Wait until the client has read everything (so disconnecting doesn't
+    /// discard the end of the reply).
+    fn flush(&mut self) -> std::io::Result<()> {
+        let h = self.pipe.as_raw_handle();
+        let ok = self.guarded(|| unsafe { FlushFileBuffers(h) });
+        if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    }
+}
+
 fn serve(sh: &Shared, pipe: &File) {
+    let guard = WriteGuard::start();
+    let mut w = Replies { pipe, guard: guard.as_ref() };
+    respond(sh, pipe, &mut w);
+    let _ = w.flush();
+}
+
+/// When the process `pid` started (100 ns units), to tell a process from a
+/// later one that reuses its ID; 0 if it can't be read.
+fn process_started(pid: u32) -> u64 {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return 0;
+        }
+        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut exited, mut kernel, mut user) = (z, z, z, z);
+        let ok = GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(h);
+        if ok == 0 { 0 } else { (created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64 }
+    }
+}
+
+fn respond(sh: &Shared, pipe: &File, w: &mut Replies) {
     let Ok(req) = read_request(pipe) else { return };
-    let mut w = pipe;
-    let reply = |w: &mut &File, status: u8, msg: &str| {
+    let reply = |w: &mut Replies, status: u8, msg: &str| {
         let mut out = vec![status];
         put_bytes(&mut out, msg.as_bytes());
         let _ = wire::send(w, &out);
@@ -885,31 +1157,31 @@ fn serve(sh: &Shared, pipe: &File) {
     let mut r = Reader::new(&req);
     let protocol = r.u8().ok();
     if protocol != Some(wire::PROTOCOL) {
-        return reply(&mut w, proto::ERROR, &wire::protocol_mismatch(protocol));
+        return reply(w, proto::ERROR, &wire::protocol_mismatch(protocol));
     }
     match r.u8() {
         Ok(proto::QUERY) => {
             let parsed = (|| Ok::<_, std::io::Error>((r.u8()? != 0, r.u32()?, String::from_utf8_lossy(r.bytes()?).into_owned(), String::from_utf8_lossy(r.bytes()?).into_owned())))();
-            let Ok((regex, limit, scope, text)) = parsed else { return reply(&mut w, proto::ERROR, "malformed request") };
+            let Ok((regex, limit, scope, text)) = parsed else { return reply(w, proto::ERROR, "malformed request") };
             let order = r.u8().unwrap_or(proto::NAME_ASC);
             let first = r.u32().unwrap_or(u32::MAX) as usize;
             let seq = r.u64().unwrap_or(0);
             if text.len() > 4096 {
-                return reply(&mut w, proto::ERROR, "queries are limited to 4096 bytes");
+                return reply(w, proto::ERROR, "queries are limited to 4096 bytes");
             }
             let Some(drive) = sh.drives.iter().find(|d| index::in_scope(&scope, &d.root)) else {
                 let roots: Vec<&str> = sh.drives.iter().map(|d| d.root.as_str()).collect();
-                return reply(&mut w, proto::NOT_COVERED, &roots.join("\n"));
+                return reply(w, proto::NOT_COVERED, &roots.join("\n"));
             };
             let Some(live) = drive.live.read().unwrap_or_else(PoisonError::into_inner).clone() else {
-                return reply(&mut w, proto::BUSY, "this drive's first index is still being built");
+                return reply(w, proto::BUSY, "this drive's first index is still being built");
             };
             let m = match Matcher::new(&text, regex) {
                 Ok(Some(m)) => m,
-                Ok(None) => return send_rows(&mut w, Vec::new(), 0, order, first),
-                Err(e) => return reply(&mut w, proto::ERROR, &e),
+                Ok(None) => return send_rows(w, Vec::new(), 0, order, first),
+                Err(e) => return reply(w, proto::ERROR, &e),
             };
-            let Some(token) = client_token(pipe) else { return reply(&mut w, proto::ERROR, "could not identify the client") };
+            let Some(token) = client_token(pipe) else { return reply(w, proto::ERROR, "could not identify the client") };
             let limit = limit.min(proto::MAX_LIMIT) as usize;
             let mut pid = 0u32;
             unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) };
@@ -921,7 +1193,7 @@ fn serve(sh: &Shared, pipe: &File) {
                 if clients.len() > 256 {
                     clients.retain(|_, c| Arc::strong_count(c) > 1);
                 }
-                clients.entry(pid).or_default().clone()
+                clients.entry((pid, process_started(pid))).or_default().clone()
             };
             if seq != 0 {
                 latest.fetch_max(seq, Relaxed);
@@ -941,7 +1213,7 @@ fn serve(sh: &Shared, pipe: &File) {
             };
             // Superseded: the client has moved on.
             let Some((rows, total)) = found else { return };
-            send_rows(&mut w, rows, total, order, first);
+            send_rows(w, rows, total, order, first);
         }
         Ok(proto::STATUS) => {
             let mut st = Status {
@@ -962,15 +1234,15 @@ fn serve(sh: &Shared, pipe: &File) {
                     }
                 }
             }
-            let _ = wire::send(&mut w, &proto::encode_status(&st));
+            let _ = wire::send(w, &proto::encode_status(&st));
         }
-        _ => reply(&mut w, proto::ERROR, "unknown request"),
+        _ => reply(w, proto::ERROR, "unknown request"),
     }
 }
 
 /// Stream rows: the `first` that sort first in `order` (selected in linear
 /// time, then sorted), then the rest in chunks; folders sent once each.
-fn send_rows(w: &mut &File, mut rows: Vec<Row>, total: usize, order: u8, first: usize) {
+fn send_rows(w: &mut impl Write, mut rows: Vec<Row>, total: usize, order: u8, first: usize) {
     let desc = order == proto::NAME_DESC;
     let cmp = |a: &Row, b: &Row| fsys::cmp_rows(a, b, SortKey::Name, desc);
     let first = first.clamp(1, MAX_FIRST).min(rows.len());

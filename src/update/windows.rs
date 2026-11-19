@@ -144,9 +144,7 @@ pub fn apply(bin: &Path, sig: &Path, force: bool) -> Result<String, String> {
         }
         if running && !(scm::start().is_ok() && wait_ready(Duration::from_secs(60))) {
             let _ = scm::stop_and_wait(Duration::from_secs(30));
-            let failed = dir.join("fex.exe.failed");
-            let _ = fs::remove_file(&failed);
-            let restored = had_old && fs::rename(&target, &failed).is_ok() && fs::rename(dir.join("fex.exe.old"), &target).is_ok();
+            let restored = had_old && restore_previous(&dir);
             if moved {
                 let _ = scm::set_command(&s.command);
             }
@@ -157,11 +155,35 @@ pub fn apply(bin: &Path, sig: &Path, force: bool) -> Result<String, String> {
     Ok(format!("FEx {v} installed in {}{}", target.display(), if running { "; the index service restarted with its saved indexes" } else { "" }))
 }
 
+/// Put `fex.exe.old` back as `fex.exe`, keeping the failed one as
+/// `fex.exe.failed`. The old copy is copied, not renamed (it may still be
+/// running, or be held by a scanner), and if that fails the failed copy goes
+/// back in place: there is always a `fex.exe` for the service to run.
+fn restore_previous(dir: &Path) -> bool {
+    let (target, old, failed) = (dir.join("fex.exe"), dir.join("fex.exe.old"), dir.join("fex.exe.failed"));
+    let _ = fs::remove_file(&failed);
+    if fs::rename(&target, &failed).is_err() {
+        return false;
+    }
+    if fs::copy(&old, &target).is_ok() {
+        return true;
+    }
+    let _ = fs::remove_file(&target);
+    let _ = fs::rename(&failed, &target);
+    false
+}
+
 /// From the app: install a verified download as administrator. Windows
 /// asks (UAC); the elevated process is the installed copy, never the
 /// download.
 pub fn elevate_apply(d: &Download, force: bool) -> Result<(), String> {
-    let installer = installed_path()?;
+    // Only ever elevate the copy in Program Files. A copy run from Downloads
+    // or the desktop is writable by the user (and by anything running as
+    // them), so it could be swapped between the check and the UAC prompt.
+    let installer = install_dir()?.join("fex.exe");
+    if !installer.is_file() {
+        return Err("in-app updates need FEx installed: run `fex service install` as administrator once, or download the new release from GitHub".into());
+    }
     let report_file = installer.with_file_name(REPORT);
     let before = fs::metadata(&report_file).and_then(|m| m.modified()).ok();
     let params = format!("update apply \"{}\" \"{}\"{}", d.bin.display(), d.sig.display(), if force { " --force" } else { "" });

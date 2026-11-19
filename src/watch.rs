@@ -51,7 +51,7 @@ impl Drop for Watcher {
 /// Watch `dir` (non-recursively), delivering coalesced batches to `sink`.
 pub fn watch(dir: String, sink: impl Fn(Vec<Change>) + Send + 'static) -> Watcher {
     let base = dir.clone();
-    spawn(dir, false, Duration::from_millis(100), move |batch| {
+    spawn(dir, false, Duration::from_millis(100), false, move |batch| {
         let Some(changes) = batch else {
             sink(vec![Change::Rescan]); // the kernel's buffer overflowed
             return;
@@ -74,18 +74,30 @@ pub fn watch(dir: String, sink: impl Fn(Vec<Change>) + Send + 'static) -> Watche
 }
 
 /// Watch everything below `dir`. `sink` receives (action, path relative to
-/// `dir`) pairs, or `None` when changes were lost (the kernel's buffer
-/// overflowed).
+/// `dir`) pairs, or `None` when changes were lost: the kernel's buffer
+/// overflowed, or the watch ended on its own (the folder couldn't be
+/// opened or watched, or the sink failed), after which nothing more comes.
 pub fn watch_tree(dir: String, sink: impl FnMut(Option<Vec<(u32, String)>>) + Send + 'static) -> Watcher {
-    spawn(dir, true, Duration::from_millis(500), sink)
+    spawn(dir, true, Duration::from_millis(500), true, sink)
 }
 
-fn spawn(dir: String, subtree: bool, pause: Duration, mut sink: impl FnMut(Option<Vec<(u32, String)>>) + Send + 'static) -> Watcher {
+fn spawn(
+    dir: String,
+    subtree: bool,
+    pause: Duration,
+    report_end: bool,
+    mut sink: impl FnMut(Option<Vec<(u32, String)>>) + Send + 'static,
+) -> Watcher {
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     thread::spawn(move || {
         // A failing sink ends the watch instead of the application.
         let _ = catch_unwind(AssertUnwindSafe(|| run(&dir, subtree, pause, &s, &mut sink)));
+        // Ended without being asked to: whoever relies on it must not go on
+        // believing it's current.
+        if report_end && !s.load(Relaxed) {
+            let _ = catch_unwind(AssertUnwindSafe(|| sink(None)));
+        }
     });
     Watcher { stop }
 }
@@ -193,6 +205,17 @@ mod tests {
             }
         }
         (state, upserts)
+    }
+
+    #[test]
+    fn a_tree_watch_that_cannot_start_reports_lost_changes() {
+        let missing = std::env::temp_dir().join(format!("fex-watch-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let (tx, rx) = channel();
+        let _w = watch_tree(missing.to_string_lossy().into_owned(), move |batch| {
+            let _ = tx.send(batch.is_none());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true), "the end of the watch must be reported as lost changes");
     }
 
     #[test]

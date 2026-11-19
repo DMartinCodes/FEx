@@ -8,6 +8,12 @@
 //! is crawled again (in the background, serving the saved index meanwhile).
 //!
 //! Needs administrator rights (opening the volume), which the service has.
+//!
+//! NTFS only: ReFS (Dev Drives among others) logs version 3 records with
+//! 128-bit file IDs, which this reader doesn't parse. Rather than follow such
+//! a journal and silently miss changes (permission changes included), its
+//! volumes count as having no journal: crawled at each start, and checked
+//! folder by folder at query time.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -56,8 +62,23 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// `C:\` -> the volume device `\\.\C:`.
+/// Whether the volume at `root` (`C:\`) is NTFS.
+fn is_ntfs(letter: char) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+    let root = wide(&format!(r"{letter}:\"));
+    let mut fs = [0u16; 32];
+    let ok = unsafe {
+        GetVolumeInformationW(root.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), fs.as_mut_ptr(), fs.len() as u32)
+    };
+    let len = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
+    ok != 0 && String::from_utf16_lossy(&fs[..len]) == "NTFS"
+}
+
 fn open_volume(root: &str) -> Option<Volume> {
     let letter = root.chars().next().filter(|c| c.is_ascii_alphabetic() && root[1..].starts_with(':'))?;
+    if !is_ntfs(letter) {
+        return None;
+    }
     let name = wide(&format!(r"\\.\{letter}:"));
     let h = unsafe { CreateFileW(name.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
     (h != INVALID_HANDLE_VALUE).then_some(Volume(h))

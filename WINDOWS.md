@@ -27,9 +27,16 @@ fex update               & rem download, verify and install it (restarts the ser
 fex service debug        & rem run in the console instead (Ctrl+C ends it unsaved)
 ```
 
+The app's own Update button installs through the copy in
+`%ProgramFiles%\FEx`, so it needs `fex service install` once; a copy run
+from elsewhere is never elevated (`fex update` from an administrator prompt
+still works anywhere).
+
 State lives in `%ProgramData%\FEx\Service` (readable by SYSTEM and elevated
 Administrators only): one saved index and journal position per drive, and
-the profile. The log is `%ProgramData%\FEx\service.log`, readable by
+the profile. The service checks both folders at every start: one it didn't
+create (standard users can create folders in ProgramData) is moved aside
+and replaced, and links are removed, before anything is written. The log is `%ProgramData%\FEx\service.log`, readable by
 everyone (timings and drive roots, no file names); `fex service log` shows
 its end. Set `FEX_RESERVE` (percent) on the service to override the CPU
 reserve, and `FEX_MEMORY_FLOOR` (percent, default 10) to change when it
